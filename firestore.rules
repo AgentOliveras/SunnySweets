@@ -1,0 +1,52 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Default deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Recipes collection
+    match /recipes/{recipeId} {
+      allow read, write: if isSignedIn();
+    }
+
+    // Presets collection
+    match /presets/{presetId} {
+      allow read, write: if isSignedIn();
+    }
+
+    // Mixers collection
+    match /mixers/{mixerId} {
+      allow read, write: if isSignedIn();
+    }
+
+    // History collection
+    match /history/{historyId} {
+      allow read, write: if isSignedIn();
+    }
+
+    // Master Ingredients collection
+    match /master_ingredients/{ingredientId} {
+      allow read, write: if isSignedIn();
+    }
+
+    // User Settings collection
+    match /settings/{userId} {
+      allow read, write: if isSignedIn();
+    }
+
+    // Workspaces collection
+    match /workspaces/{workspaceId} {
+      allow read, write: if isSignedIn();
+    }
+  }
+}
+
+

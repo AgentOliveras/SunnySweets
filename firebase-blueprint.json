@@ -1,0 +1,93 @@
+{
+  "entities": {
+    "recipes": {
+      "title": "Recipe",
+      "description": "Bakery recipes with base yields and ingredients",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "batchYieldQuantity": { "type": "number" },
+        "batchYieldUnit": { "type": "string" },
+        "defaultWastePercent": { "type": "number" },
+        "archived": { "type": "boolean" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["userId", "name", "batchYieldQuantity", "batchYieldUnit"]
+    },
+    "presets": {
+      "title": "Production Preset",
+      "description": "Reusable product packaging and item weight presets",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "name": { "type": "string" },
+        "finishedWeight": { "type": "number" },
+        "weightUnit": { "type": "string" },
+        "quantityPerUnit": { "type": "number" },
+        "unitName": { "type": "string" },
+        "expectedYield": { "type": "string" }
+      },
+      "required": ["userId", "name", "finishedWeight", "weightUnit", "quantityPerUnit"]
+    },
+    "mixers": {
+      "title": "Mixer Capacity",
+      "description": "Equipment mixer details and safe batch capacities",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "name": { "type": "string" },
+        "maxWeight": { "type": "number" },
+        "weightUnit": { "type": "string" }
+      },
+      "required": ["userId", "name", "maxWeight", "weightUnit"]
+    },
+    "history": {
+      "title": "Production History",
+      "description": "Saved production calculations and batch sheets",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "recipeId": { "type": "string" },
+        "recipeName": { "type": "string" },
+        "calculatedAt": { "type": "string" },
+        "totalPieces": { "type": "number" },
+        "scalingMultiplier": { "type": "number" },
+        "status": { "type": "string" }
+      },
+      "required": ["userId", "recipeName", "calculatedAt"]
+    },
+    "settings": {
+      "title": "User Settings",
+      "description": "Business measurement and UI preferences",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "defaultWeightUnit": { "type": "string" },
+        "defaultWastePercent": { "type": "number" },
+        "theme": { "type": "string" },
+        "decimalPlaces": { "type": "number" },
+        "activeWorkspaceId": { "type": "string" }
+      },
+      "required": ["userId", "defaultWeightUnit"]
+    },
+    "workspaces": {
+      "title": "Workspace & Access Group",
+      "description": "Shared workspace for team members and groups with access",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "ownerId": { "type": "string" },
+        "members": { "type": "array" },
+        "groups": { "type": "array" },
+        "code": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "name", "ownerId"]
+    }
+  }
+}

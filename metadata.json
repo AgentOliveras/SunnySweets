@@ -1,0 +1,6 @@
+{
+  "name": "Recipe Calculator",
+  "description": "Production-ready mobile-first bakery and food production calculator with recipe scaling, unit conversions, mixer capacity validation, guided mixing mode, and batch history.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
