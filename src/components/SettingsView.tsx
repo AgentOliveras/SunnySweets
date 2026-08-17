@@ -13,9 +13,16 @@ import {
   Hash,
   Save,
   CheckCircle2,
+  Cloud,
+  RefreshCw,
+  AlertCircle,
+  Wifi,
+  WifiOff,
 } from 'lucide-react';
 import { UserSettings, WeightUnit } from '../types';
 import { WEIGHT_UNITS } from '../utils/units';
+import { store } from '../services/store';
+import { auth } from '../services/firebase';
 
 interface SettingsViewProps {
   settings: UserSettings;
@@ -41,6 +48,28 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [standardizeStatus, setStandardizeStatus] = useState<string | null>(null);
   const [isStandardizing, setIsStandardizing] = useState(false);
   const [saveFeedback, setSaveFeedback] = useState<string | null>(null);
+  const [syncStatus, setSyncStatus] = useState(store.getSyncStatus());
+  const [isManualSyncing, setIsManualSyncing] = useState(false);
+
+  // Subscribe to store updates for real-time sync status
+  useEffect(() => {
+    const unsub = store.subscribe(() => {
+      setSyncStatus(store.getSyncStatus());
+    });
+    return () => unsub();
+  }, []);
+
+  const handleManualSync = async () => {
+    setIsManualSyncing(true);
+    try {
+      await store.syncAllWithCloud();
+      showNotification('Cloud synchronization completed successfully.');
+    } catch (err) {
+      showNotification('Sync failed. Please check network connection.');
+    } finally {
+      setIsManualSyncing(false);
+    }
+  };
 
   // Sync internal state with external settings prop changes
   useEffect(() => {
@@ -314,6 +343,66 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </button>
           </div>
         </form>
+
+        {/* Cloud Synchronization & Storage */}
+        <div className="bg-white dark:bg-[#1E1B18] border border-[#E5E1DA] dark:border-[#2D2925] rounded-xl p-6 shadow-sm space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div>
+              <h3 className="font-serif font-semibold text-base text-[#5A534B] dark:text-[#EAE6E1] flex items-center gap-2">
+                <Cloud className="w-5 h-5 text-[#D4A373]" />
+                <span>Cloud Synchronization & Persistence</span>
+              </h3>
+              <p className="text-xs text-[#8B7E74] dark:text-[#A39E93] mt-1">
+                Real-time multi-device database sync powered by Firebase Firestore. Changes automatically save locally and stream to the cloud.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <span
+                className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold ${
+                  syncStatus.status === 'synced'
+                    ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800/40'
+                    : syncStatus.status === 'syncing'
+                    ? 'bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-300 border border-amber-200 dark:border-amber-800/40'
+                    : syncStatus.status === 'offline'
+                    ? 'bg-stone-100 text-stone-600 dark:bg-stone-800 dark:text-stone-300 border border-stone-200 dark:border-stone-700'
+                    : 'bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-300 border border-rose-200 dark:border-rose-800/40'
+                }`}
+              >
+                {syncStatus.status === 'synced' && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />}
+                {syncStatus.status === 'syncing' && <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-500" />}
+                {syncStatus.status === 'offline' && <WifiOff className="w-3.5 h-3.5 text-stone-400" />}
+                {syncStatus.status === 'error' && <AlertCircle className="w-3.5 h-3.5 text-rose-500" />}
+                <span>{syncStatus.message}</span>
+              </span>
+
+              <button
+                type="button"
+                onClick={handleManualSync}
+                disabled={isManualSyncing}
+                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-[#F5F2ED] dark:bg-[#25221F] hover:bg-[#EEECE8] dark:hover:bg-[#332F2B] text-[#5A534B] dark:text-[#EAE6E1] text-xs font-bold rounded-lg border border-[#E5E1DA] dark:border-[#332F2B] transition cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isManualSyncing ? 'animate-spin' : ''}`} />
+                <span>{isManualSyncing ? 'Syncing...' : 'Sync Now'}</span>
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1 border-t border-[#F0ECE6] dark:border-[#2D2925] text-xs text-[#8B7E74] dark:text-[#A39E93]">
+            <div className="flex items-center gap-2">
+              <span className="font-semibold text-[#5A534B] dark:text-[#D4CEC7]">Active Account:</span>
+              <span className="truncate">{auth.currentUser?.email || 'Local Offline Session'}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="font-semibold text-[#5A534B] dark:text-[#D4CEC7]">Database Items:</span>
+              <span>{syncStatus.itemCount} total records</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="font-semibold text-[#5A534B] dark:text-[#D4CEC7]">Last Synced:</span>
+              <span>{syncStatus.lastSynced ? syncStatus.lastSynced.toLocaleTimeString() : 'Just now'}</span>
+            </div>
+          </div>
+        </div>
 
         {/* Appearance & Verification Suite */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">

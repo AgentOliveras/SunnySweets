@@ -7,6 +7,7 @@ import {
   query,
   where,
   getDocs,
+  getDocFromServer,
 } from 'firebase/firestore';
 import { onAuthStateChanged } from 'firebase/auth';
 import {
@@ -21,7 +22,7 @@ import {
   AccessGroup,
   WeightUnit,
 } from '../types';
-import { db, auth, handleFirestoreError, OperationType, sanitizeForFirestore } from './firebase';
+import { db, auth, handleFirestoreError, OperationType, sanitizeForFirestore, signInWithGoogle } from './firebase';
 import { SAMPLE_RECIPES, SAMPLE_PRESETS, SAMPLE_MIXERS, INITIAL_SETTINGS, SAMPLE_MASTER_INGREDIENTS } from './sampleData';
 import { standardizeIngredientsToUnit } from '../utils/units';
 
@@ -34,7 +35,15 @@ const STORAGE_KEYS = {
   MASTER_INGREDIENTS: 'recipe_calc_master_ingredients',
   ACTIVE_CHECKLIST: 'recipe_calc_active_checklist',
   WORKSPACES: 'recipe_calc_workspaces',
+  LAST_SYNCED: 'recipe_calc_last_synced',
 };
+
+export interface SyncStatusInfo {
+  status: 'synced' | 'syncing' | 'offline' | 'error';
+  lastSynced: Date | null;
+  message: string;
+  itemCount: number;
+}
 
 // Helper for local storage read/write
 function getLocal<T>(key: string, fallback: T): T {
@@ -70,11 +79,21 @@ export class StoreManager {
   private sessionUserEmail: string | null = getLocal<string | null>('recipe_calc_user_email', 'jaoliveras@gmail.com');
   private initialized = false;
   private unsubs: Array<() => void> = [];
+  private syncStatus: SyncStatusInfo = {
+    status: 'offline',
+    lastSynced: null,
+    message: 'Local Mode',
+    itemCount: 0,
+  };
 
   private listeners: Set<() => void> = new Set();
 
   private constructor() {
     this.loadFromLocalStorage();
+    const storedLastSync = localStorage.getItem(STORAGE_KEYS.LAST_SYNCED);
+    if (storedLastSync) {
+      this.syncStatus.lastSynced = new Date(storedLastSync);
+    }
   }
 
   public static getInstance(): StoreManager {
@@ -182,11 +201,23 @@ export class StoreManager {
     this.activeWorkspaceId = this.settings.activeWorkspaceId || this.workspaces[0]?.id || 'ws-main';
   }
 
+  private async testFirestoreConnection(): Promise<void> {
+    try {
+      await getDocFromServer(doc(db, 'settings', 'test-connection'));
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('the client is offline')) {
+        console.warn('Firestore is currently offline or unreachable.');
+      }
+    }
+  }
+
   public initFirebaseSync(): void {
     if (this.initialized) return;
     this.initialized = true;
 
-    onAuthStateChanged(auth, (user) => {
+    this.testFirestoreConnection().catch((err) => console.warn('Connection test notice:', err));
+
+    onAuthStateChanged(auth, async (user) => {
       // Clear previous snapshot listeners
       this.unsubs.forEach((unsub) => unsub());
       this.unsubs = [];
@@ -195,8 +226,15 @@ export class StoreManager {
         const uid = user.uid;
         this.currentUserId = uid;
         this.settings.userId = uid;
+        this.syncStatus = {
+          status: 'syncing',
+          lastSynced: this.syncStatus.lastSynced,
+          message: 'Connecting to Cloud Database...',
+          itemCount: this.getTotalItemCount(),
+        };
+        this.notify();
 
-        // Subscribe to Workspaces for user
+        // 1. Subscribe to Workspaces for user
         const wsQuery = query(collection(db, 'workspaces'));
         const unsubWorkspaces = onSnapshot(
           wsQuery,
@@ -204,9 +242,19 @@ export class StoreManager {
             if (!snapshot.empty) {
               const remoteWs: Workspace[] = snapshot.docs.map((d) => d.data() as Workspace);
               if (remoteWs.length > 0) {
+                // Merge local workspaces not in remote
+                const remoteIds = new Set(remoteWs.map((w) => w.id));
+                const localOnly = this.workspaces.filter((w) => !remoteIds.has(w.id));
+                if (localOnly.length > 0) {
+                  localOnly.forEach((w) => {
+                    setDoc(doc(db, 'workspaces', w.id), sanitizeForFirestore({ ...w, ownerId: uid })).catch((err) =>
+                      handleFirestoreError(err, OperationType.WRITE, `workspaces/${w.id}`)
+                    );
+                  });
+                }
                 this.workspaces = remoteWs;
                 setLocal(STORAGE_KEYS.WORKSPACES, remoteWs);
-                this.notify();
+                this.updateSyncSuccess();
               }
             } else if (this.workspaces.length > 0) {
               this.workspaces.forEach((ws) => {
@@ -214,112 +262,153 @@ export class StoreManager {
                   handleFirestoreError(err, OperationType.WRITE, `workspaces/${ws.id}`)
                 );
               });
+              this.updateSyncSuccess();
             }
           },
           (error) => {
-            handleFirestoreError(error, OperationType.GET, 'workspaces');
+            this.handleSyncError(error, 'workspaces');
           }
         );
         this.unsubs.push(unsubWorkspaces);
 
-        // Subscribe to Recipes (Realtime auto sync)
+        // 2. Subscribe to Recipes (Realtime auto sync)
         const recipesQuery = query(collection(db, 'recipes'));
         const unsubRecipes = onSnapshot(
           recipesQuery,
           (snapshot) => {
             if (!snapshot.empty) {
               const remoteRecipes: Recipe[] = snapshot.docs.map((d) => d.data() as Recipe);
+              const remoteIds = new Set(remoteRecipes.map((r) => r.id));
+              const localOnly = this.recipes.filter((r) => !remoteIds.has(r.id));
+              if (localOnly.length > 0) {
+                localOnly.forEach((r) => {
+                  setDoc(doc(db, 'recipes', r.id), sanitizeForFirestore({ ...r, userId: uid })).catch((err) =>
+                    handleFirestoreError(err, OperationType.WRITE, `recipes/${r.id}`)
+                  );
+                });
+              }
               this.recipes = remoteRecipes;
               setLocal(STORAGE_KEYS.RECIPES, remoteRecipes);
-              this.notify();
-            } else if (this.recipes.length === SAMPLE_RECIPES.length) {
+              this.updateSyncSuccess();
+            } else if (this.recipes.length > 0) {
               this.recipes.forEach((r) => {
                 setDoc(doc(db, 'recipes', r.id), sanitizeForFirestore({ ...r, userId: uid })).catch((err) =>
                   handleFirestoreError(err, OperationType.WRITE, `recipes/${r.id}`)
                 );
               });
+              this.updateSyncSuccess();
             }
           },
           (error) => {
-            handleFirestoreError(error, OperationType.GET, 'recipes');
+            this.handleSyncError(error, 'recipes');
           }
         );
         this.unsubs.push(unsubRecipes);
 
-        // Subscribe to Presets
+        // 3. Subscribe to Presets
         const presetsQuery = query(collection(db, 'presets'));
         const unsubPresets = onSnapshot(
           presetsQuery,
           (snapshot) => {
             if (!snapshot.empty) {
-              const remotePresets: ProductionPreset[] = snapshot.docs.map(
-                (d) => d.data() as ProductionPreset
-              );
+              const remotePresets: ProductionPreset[] = snapshot.docs.map((d) => d.data() as ProductionPreset);
+              const remoteIds = new Set(remotePresets.map((p) => p.id));
+              const localOnly = this.presets.filter((p) => !remoteIds.has(p.id));
+              if (localOnly.length > 0) {
+                localOnly.forEach((p) => {
+                  setDoc(doc(db, 'presets', p.id), sanitizeForFirestore({ ...p, userId: uid })).catch((err) =>
+                    handleFirestoreError(err, OperationType.WRITE, `presets/${p.id}`)
+                  );
+                });
+              }
               this.presets = remotePresets;
               setLocal(STORAGE_KEYS.PRESETS, remotePresets);
-              this.notify();
-            } else if (this.presets.length === SAMPLE_PRESETS.length) {
+              this.updateSyncSuccess();
+            } else if (this.presets.length > 0) {
               this.presets.forEach((p) => {
                 setDoc(doc(db, 'presets', p.id), sanitizeForFirestore({ ...p, userId: uid })).catch((err) =>
                   handleFirestoreError(err, OperationType.WRITE, `presets/${p.id}`)
                 );
               });
+              this.updateSyncSuccess();
             }
           },
           (error) => {
-            handleFirestoreError(error, OperationType.GET, 'presets');
+            this.handleSyncError(error, 'presets');
           }
         );
         this.unsubs.push(unsubPresets);
 
-        // Subscribe to Mixers
+        // 4. Subscribe to Mixers
         const mixersQuery = query(collection(db, 'mixers'));
         const unsubMixers = onSnapshot(
           mixersQuery,
           (snapshot) => {
             if (!snapshot.empty) {
               const remoteMixers: Mixer[] = snapshot.docs.map((d) => d.data() as Mixer);
+              const remoteIds = new Set(remoteMixers.map((m) => m.id));
+              const localOnly = this.mixers.filter((m) => !remoteIds.has(m.id));
+              if (localOnly.length > 0) {
+                localOnly.forEach((m) => {
+                  setDoc(doc(db, 'mixers', m.id), sanitizeForFirestore({ ...m, userId: uid })).catch((err) =>
+                    handleFirestoreError(err, OperationType.WRITE, `mixers/${m.id}`)
+                  );
+                });
+              }
               this.mixers = remoteMixers;
               setLocal(STORAGE_KEYS.MIXERS, remoteMixers);
-              this.notify();
-            } else if (this.mixers.length === SAMPLE_MIXERS.length) {
+              this.updateSyncSuccess();
+            } else if (this.mixers.length > 0) {
               this.mixers.forEach((m) => {
                 setDoc(doc(db, 'mixers', m.id), sanitizeForFirestore({ ...m, userId: uid })).catch((err) =>
                   handleFirestoreError(err, OperationType.WRITE, `mixers/${m.id}`)
                 );
               });
+              this.updateSyncSuccess();
             }
           },
           (error) => {
-            handleFirestoreError(error, OperationType.GET, 'mixers');
+            this.handleSyncError(error, 'mixers');
           }
         );
         this.unsubs.push(unsubMixers);
 
-        // Subscribe to History
+        // 5. Subscribe to History
         const historyQuery = query(collection(db, 'history'));
         const unsubHistory = onSnapshot(
           historyQuery,
           (snapshot) => {
             if (!snapshot.empty) {
-              const remoteHistory: ProductionHistoryEntry[] = snapshot.docs.map(
-                (d) => d.data() as ProductionHistoryEntry
-              );
-              remoteHistory.sort(
-                (a, b) => new Date(b.calculatedAt).getTime() - new Date(a.calculatedAt).getTime()
-              );
+              const remoteHistory: ProductionHistoryEntry[] = snapshot.docs.map((d) => d.data() as ProductionHistoryEntry);
+              remoteHistory.sort((a, b) => new Date(b.calculatedAt).getTime() - new Date(a.calculatedAt).getTime());
+              const remoteIds = new Set(remoteHistory.map((h) => h.id));
+              const localOnly = this.history.filter((h) => !remoteIds.has(h.id));
+              if (localOnly.length > 0) {
+                localOnly.forEach((h) => {
+                  setDoc(doc(db, 'history', h.id), sanitizeForFirestore({ ...h, userId: uid })).catch((err) =>
+                    handleFirestoreError(err, OperationType.WRITE, `history/${h.id}`)
+                  );
+                });
+              }
               this.history = remoteHistory;
               setLocal(STORAGE_KEYS.HISTORY, remoteHistory);
-              this.notify();
+              this.updateSyncSuccess();
+            } else if (this.history.length > 0) {
+              this.history.forEach((h) => {
+                setDoc(doc(db, 'history', h.id), sanitizeForFirestore({ ...h, userId: uid })).catch((err) =>
+                  handleFirestoreError(err, OperationType.WRITE, `history/${h.id}`)
+                );
+              });
+              this.updateSyncSuccess();
             }
           },
           (error) => {
-            handleFirestoreError(error, OperationType.GET, 'history');
+            this.handleSyncError(error, 'history');
           }
         );
         this.unsubs.push(unsubHistory);
 
-        // Subscribe to Settings
+        // 6. Subscribe to Settings
         const settingsDocRef = doc(db, 'settings', uid);
         const unsubSettings = onSnapshot(
           settingsDocRef,
@@ -333,48 +422,184 @@ export class StoreManager {
                 userId: uid,
               };
               setLocal(STORAGE_KEYS.SETTINGS, this.settings);
-              this.notify();
+              this.updateSyncSuccess();
             } else {
               setDoc(settingsDocRef, sanitizeForFirestore({ ...this.settings, userId: uid }), { merge: true }).catch((err) =>
                 handleFirestoreError(err, OperationType.WRITE, `settings/${uid}`)
               );
+              this.updateSyncSuccess();
             }
           },
           (error) => {
-            handleFirestoreError(error, OperationType.GET, `settings/${uid}`);
+            this.handleSyncError(error, `settings/${uid}`);
           }
         );
         this.unsubs.push(unsubSettings);
 
-        // Subscribe to Master Ingredients
+        // 7. Subscribe to Master Ingredients
         const masterIngsQuery = query(collection(db, 'master_ingredients'));
         const unsubMasterIngs = onSnapshot(
           masterIngsQuery,
           (snapshot) => {
             if (!snapshot.empty) {
-              const remoteIngs: MasterIngredient[] = snapshot.docs.map(
-                (d) => d.data() as MasterIngredient
-              );
+              const remoteIngs: MasterIngredient[] = snapshot.docs.map((d) => d.data() as MasterIngredient);
+              const remoteIds = new Set(remoteIngs.map((i) => i.id));
+              const localOnly = this.masterIngredients.filter((i) => !remoteIds.has(i.id));
+              if (localOnly.length > 0) {
+                localOnly.forEach((mi) => {
+                  setDoc(doc(db, 'master_ingredients', mi.id), sanitizeForFirestore({ ...mi, userId: uid })).catch((err) =>
+                    handleFirestoreError(err, OperationType.WRITE, `master_ingredients/${mi.id}`)
+                  );
+                });
+              }
               this.masterIngredients = remoteIngs;
               setLocal(STORAGE_KEYS.MASTER_INGREDIENTS, remoteIngs);
-              this.notify();
-            } else if (this.masterIngredients.length === SAMPLE_MASTER_INGREDIENTS.length) {
+              this.updateSyncSuccess();
+            } else if (this.masterIngredients.length > 0) {
               this.masterIngredients.forEach((mi) => {
                 setDoc(doc(db, 'master_ingredients', mi.id), sanitizeForFirestore({ ...mi, userId: uid })).catch((err) =>
                   handleFirestoreError(err, OperationType.WRITE, `master_ingredients/${mi.id}`)
                 );
               });
+              this.updateSyncSuccess();
             }
           },
           (error) => {
-            handleFirestoreError(error, OperationType.GET, 'master_ingredients');
+            this.handleSyncError(error, 'master_ingredients');
           }
         );
         this.unsubs.push(unsubMasterIngs);
       } else {
         this.currentUserId = 'offline-user';
+        this.syncStatus = {
+          status: 'offline',
+          lastSynced: this.syncStatus.lastSynced,
+          message: 'Local Offline Mode (Sign in to sync)',
+          itemCount: this.getTotalItemCount(),
+        };
+        this.notify();
       }
     });
+  }
+
+  private getTotalItemCount(): number {
+    return (
+      this.recipes.length +
+      this.masterIngredients.length +
+      this.presets.length +
+      this.mixers.length +
+      this.history.length +
+      this.workspaces.length
+    );
+  }
+
+  private updateSyncSuccess(): void {
+    const now = new Date();
+    this.syncStatus = {
+      status: 'synced',
+      lastSynced: now,
+      message: 'Cloud Synced & Up to Date',
+      itemCount: this.getTotalItemCount(),
+    };
+    localStorage.setItem(STORAGE_KEYS.LAST_SYNCED, now.toISOString());
+    this.notify();
+  }
+
+  private handleSyncError(error: unknown, path: string): void {
+    handleFirestoreError(error, OperationType.GET, path);
+    this.syncStatus = {
+      status: 'error',
+      lastSynced: this.syncStatus.lastSynced,
+      message: 'Cloud Sync Notice: Retrying...',
+      itemCount: this.getTotalItemCount(),
+    };
+    this.notify();
+  }
+
+  public getSyncStatus(): SyncStatusInfo {
+    return this.syncStatus;
+  }
+
+  public async syncAllWithCloud(triggerSignInIfOffline = false): Promise<{ success: boolean; message: string; count: number }> {
+    let currentUser = auth.currentUser;
+    if (!currentUser && triggerSignInIfOffline) {
+      currentUser = await signInWithGoogle();
+    }
+
+    if (!currentUser) {
+      return {
+        success: false,
+        message: 'Please sign in with Google to enable cloud database synchronization.',
+        count: 0,
+      };
+    }
+
+    const uid = currentUser.uid;
+    this.syncStatus = {
+      status: 'syncing',
+      lastSynced: this.syncStatus.lastSynced,
+      message: 'Uploading and syncing all data to Firestore...',
+      itemCount: this.getTotalItemCount(),
+    };
+    this.notify();
+
+    try {
+      let syncedCount = 0;
+
+      // 1. Sync Recipes
+      for (const recipe of this.recipes) {
+        await setDoc(doc(db, 'recipes', recipe.id), sanitizeForFirestore({ ...recipe, userId: uid }));
+        syncedCount++;
+      }
+
+      // 2. Sync Master Ingredients
+      for (const ing of this.masterIngredients) {
+        await setDoc(doc(db, 'master_ingredients', ing.id), sanitizeForFirestore({ ...ing, userId: uid }));
+        syncedCount++;
+      }
+
+      // 3. Sync Presets
+      for (const preset of this.presets) {
+        await setDoc(doc(db, 'presets', preset.id), sanitizeForFirestore({ ...preset, userId: uid }));
+        syncedCount++;
+      }
+
+      // 4. Sync Mixers
+      for (const mixer of this.mixers) {
+        await setDoc(doc(db, 'mixers', mixer.id), sanitizeForFirestore({ ...mixer, userId: uid }));
+        syncedCount++;
+      }
+
+      // 5. Sync History
+      for (const hist of this.history) {
+        await setDoc(doc(db, 'history', hist.id), sanitizeForFirestore({ ...hist, userId: uid }));
+        syncedCount++;
+      }
+
+      // 6. Sync Workspaces
+      for (const ws of this.workspaces) {
+        await setDoc(doc(db, 'workspaces', ws.id), sanitizeForFirestore({ ...ws, ownerId: uid }));
+        syncedCount++;
+      }
+
+      // 7. Sync Settings
+      await setDoc(doc(db, 'settings', uid), sanitizeForFirestore({ ...this.settings, userId: uid }), { merge: true });
+      syncedCount++;
+
+      this.updateSyncSuccess();
+      return {
+        success: true,
+        message: `Successfully synchronized ${syncedCount} items with your Cloud Firestore database!`,
+        count: syncedCount,
+      };
+    } catch (err) {
+      this.handleSyncError(err, 'syncAllWithCloud');
+      return {
+        success: false,
+        message: err instanceof Error ? err.message : 'Sync encountered an issue.',
+        count: 0,
+      };
+    }
   }
 
   public subscribe(listener: () => void): () => void {
