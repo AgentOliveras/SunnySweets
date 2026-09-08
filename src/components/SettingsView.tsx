@@ -45,6 +45,7 @@ import {
 } from '../services/migration';
 import { BrandingSettings } from './BrandingSettings';
 import { MembersManagement } from './MembersManagement';
+import { SettingsSectionErrorBoundary } from './SettingsSectionErrorBoundary';
 
 interface SettingsViewProps {
   settings: UserSettings;
@@ -93,9 +94,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onOpenUnitTests,
   testPassedCount,
 }) => {
-  const [businessName, setBusinessName] = useState(settings.businessName || 'Artisan Bakery Co.');
+  const [businessName, setBusinessName] = useState(settings?.businessName || 'Artisan Bakery Co.');
   const [defaultWastePercent, setDefaultWastePercent] = useState<string | number>(
-    settings.defaultWastePercent !== undefined ? settings.defaultWastePercent : 6
+    settings?.defaultWastePercent !== undefined ? settings.defaultWastePercent : 6
   );
   const [standardizeStatus, setStandardizeStatus] = useState<string | null>(null);
   const [isStandardizing, setIsStandardizing] = useState(false);
@@ -186,7 +187,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       }
     });
 
-    if (settings.recipeCategories && settings.recipeCategories.length > 0) {
+    if (settings?.recipeCategories && settings.recipeCategories.length > 0) {
       settings.recipeCategories.forEach((c) => {
         if (c && c.trim()) set.add(c.trim());
       });
@@ -194,7 +195,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
     const categoriesArray = Array.from(set);
     return categoriesArray;
-  }, [allRecipes, settings.recipeCategories, syncStatus]);
+  }, [allRecipes, settings?.recipeCategories, syncStatus]);
 
   // Filtered recipe categories for search
   const filteredRecipeCategories = useMemo(() => {
@@ -225,9 +226,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   // Sync internal state with external settings prop changes
   useEffect(() => {
-    setBusinessName(settings.businessName || 'Artisan Bakery Co.');
-    setDefaultWastePercent(settings.defaultWastePercent !== undefined ? settings.defaultWastePercent : 6);
-  }, [settings.businessName, settings.defaultWastePercent]);
+    if (settings) {
+      setBusinessName(settings.businessName || 'Artisan Bakery Co.');
+      setDefaultWastePercent(settings.defaultWastePercent !== undefined ? settings.defaultWastePercent : 6);
+    }
+  }, [settings?.businessName, settings?.defaultWastePercent]);
 
   const showNotification = (msg: string) => {
     setSaveFeedback(msg);
@@ -440,6 +443,21 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     showNotification('Bakery profile and global waste settings saved and applied.');
   };
 
+  // If loading, render "Loading settings..."
+  if (!settings || store.isAuthLoading()) {
+    return (
+      <div className="flex flex-col items-center justify-center py-24 text-[#8B7E74] dark:text-[#A39E93] space-y-3">
+        <RefreshCw className="w-6 h-6 animate-spin text-[#D4A373]" />
+        <p className="text-sm font-medium">Loading settings...</p>
+      </div>
+    );
+  }
+
+  // If unauthorized: Settings should not mount at all
+  if (!store.isAuthorized()) {
+    return null;
+  }
+
   return (
     <div className="space-y-6 pb-20 md:pb-8 max-w-4xl">
       {/* Header & Status */}
@@ -510,7 +528,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   Standardize All Existing Recipe Ingredients
                 </h4>
                 <p className="text-[11px] text-[#8B7E74] dark:text-[#A39E93]">
-                  Convert and align measuring unit inputs across all {recipesCount > 0 ? `${recipesCount} recipes` : 'bakery recipes'} to {settings.defaultWeightUnit.toUpperCase()}.
+                  Convert and align measuring unit inputs across all {recipesCount > 0 ? `${recipesCount} recipes` : 'bakery recipes'} to {(settings?.defaultWeightUnit || 'g').toUpperCase()}.
                 </p>
               </div>
 
@@ -518,12 +536,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 type="button"
                 id="standardize-all-recipes-btn"
                 disabled={isStandardizing}
-                onClick={() => handleStandardize(settings.defaultWeightUnit)}
+                onClick={() => handleStandardize(settings?.defaultWeightUnit || 'g')}
                 className="inline-flex items-center justify-center gap-2 bg-[#D4A373] hover:bg-[#C49363] disabled:opacity-50 text-white font-bold px-4 py-2 rounded-xl text-xs transition shadow-sm shrink-0 cursor-pointer"
               >
                 <Scale className="w-4 h-4" />
                 <span>
-                  {isStandardizing ? 'Standardizing...' : `Standardize All to ${settings.defaultWeightUnit.toUpperCase()}`}
+                  {isStandardizing ? 'Standardizing...' : `Standardize All to ${(settings?.defaultWeightUnit || 'g').toUpperCase()}`}
                 </span>
               </button>
             </div>
@@ -1035,10 +1053,20 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         </div>
 
         {/* Workspace Branding & Appearance (Phase 0.5) */}
-        <BrandingSettings onSuccessNotice={showNotification} />
+        <SettingsSectionErrorBoundary
+          sectionTitle="Workspace Branding & Appearance"
+          fallbackMessage="Unable to load workspace branding settings. Please try again."
+        >
+          <BrandingSettings onSuccessNotice={showNotification} />
+        </SettingsSectionErrorBoundary>
 
         {/* Workspace Members & Access Management (Phase 0.6) */}
-        <MembersManagement onSuccessNotice={showNotification} />
+        <SettingsSectionErrorBoundary
+          sectionTitle="Members & Access"
+          fallbackMessage="Unable to load workspace members. Please try again."
+        >
+          <MembersManagement onSuccessNotice={showNotification} />
+        </SettingsSectionErrorBoundary>
 
         {/* Business Branding & Waste Defaults */}
         <form

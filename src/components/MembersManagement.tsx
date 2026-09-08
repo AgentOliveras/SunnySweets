@@ -28,8 +28,9 @@ interface MembersManagementProps {
 }
 
 export const MembersManagement: React.FC<MembersManagementProps> = ({ onSuccessNotice }) => {
-  const [members, setMembers] = useState<WorkspaceMemberDoc[]>([]);
+  const [members, setMembers] = useState<WorkspaceMemberDoc[]>(() => store.getWorkspaceMembers() || []);
   const [isLoading, setIsLoading] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
   const [copiedUid, setCopiedUid] = useState<string | null>(null);
 
   // Add Member Modal State
@@ -54,22 +55,27 @@ export const MembersManagement: React.FC<MembersManagementProps> = ({ onSuccessN
   const [isSubmittingRemove, setIsSubmittingRemove] = useState(false);
   const [removeError, setRemoveError] = useState<string | null>(null);
 
-  const currentRole = store.getUserRole();
+  // Reactive role & workspace state
+  const [currentRole, setCurrentRole] = useState<AccessRole | null>(() => store.getUserRole());
   const isOwner = currentRole === 'owner';
   const currentUser = auth.currentUser;
   const activeWorkspace = store.getActiveWorkspace();
   const activeWorkspaceId = activeWorkspace?.id || 'ws-main';
 
-  // Sync members from store
+  // Sync members and user role from store
   useEffect(() => {
     const updateMembersFromStore = () => {
-      setMembers(store.getWorkspaceMembers());
+      setCurrentRole(store.getUserRole());
+      const storeMembers = store.getWorkspaceMembers();
+      if (Array.isArray(storeMembers)) {
+        setMembers(storeMembers);
+      }
     };
 
     updateMembersFromStore();
     const unsubscribe = store.subscribe(updateMembersFromStore);
 
-    // Also trigger initial direct fetch
+    // Initial direct fetch
     handleRefresh();
 
     return () => {
@@ -80,21 +86,54 @@ export const MembersManagement: React.FC<MembersManagementProps> = ({ onSuccessN
   const handleRefresh = async () => {
     try {
       setIsLoading(true);
+      setFetchError(null);
       const fetched = await store.fetchWorkspaceMembersDirect(activeWorkspaceId);
-      setMembers(fetched);
+      if (Array.isArray(fetched)) {
+        setMembers(fetched);
+      } else {
+        setFetchError('Unable to load workspace members. Please try again.');
+      }
     } catch (err: any) {
       console.warn('Members fetch notice:', err);
+      setFetchError('Unable to load workspace members. Please try again.');
     } finally {
       setIsLoading(false);
     }
   };
 
   const copyToClipboard = (uid: string) => {
-    navigator.clipboard.writeText(uid);
+    if (!uid) return;
+    try {
+      if (navigator?.clipboard?.writeText) {
+        navigator.clipboard.writeText(uid).catch(() => {});
+      }
+    } catch (err) {
+      console.warn('Clipboard write error:', err);
+    }
     setCopiedUid(uid);
     setTimeout(() => {
       setCopiedUid(null);
     }, 2000);
+  };
+
+  const getMemberInitial = (member: WorkspaceMemberDoc): string => {
+    if (member?.name && typeof member.name === 'string' && member.name.trim().length > 0) {
+      return member.name.trim().charAt(0).toUpperCase();
+    }
+    if (member?.email && typeof member.email === 'string' && member.email.trim().length > 0) {
+      return member.email.trim().charAt(0).toUpperCase();
+    }
+    return 'M';
+  };
+
+  const getMemberDisplayName = (member: WorkspaceMemberDoc): string => {
+    if (member?.name && typeof member.name === 'string' && member.name.trim().length > 0) {
+      return member.name.trim();
+    }
+    if (member?.email && typeof member.email === 'string' && member.email.includes('@')) {
+      return member.email.split('@')[0] || 'Member';
+    }
+    return member?.email || 'Member';
   };
 
   const resetAddForm = () => {
@@ -300,10 +339,15 @@ export const MembersManagement: React.FC<MembersManagementProps> = ({ onSuccessN
                 <Edit3 className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
                 <span className="text-blue-800 dark:text-blue-300 font-bold">Editor Role</span>
               </>
-            ) : (
+            ) : currentRole === 'viewer' ? (
               <>
                 <Eye className="w-3.5 h-3.5 text-slate-600 dark:text-slate-400" />
                 <span className="text-slate-800 dark:text-slate-300 font-bold">Viewer Role</span>
+              </>
+            ) : (
+              <>
+                <RefreshCw className="w-3.5 h-3.5 animate-spin text-[#8B7E74]" />
+                <span className="text-[#8B7E74] dark:text-[#A39E93]">Checking Access...</span>
               </>
             )}
           </div>
@@ -333,8 +377,27 @@ export const MembersManagement: React.FC<MembersManagementProps> = ({ onSuccessN
         </div>
       </div>
 
+      {/* Visible Error Panel for Member Data Failure */}
+      {fetchError && (
+        <div className="p-4 rounded-xl bg-red-50/80 dark:bg-red-950/20 border border-red-200 dark:border-red-900/40 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-red-700 dark:text-red-300">
+          <div className="flex items-center gap-2.5">
+            <AlertCircle className="w-4 h-4 shrink-0 text-red-500" />
+            <span className="font-medium">Unable to load workspace members. Please try again.</span>
+          </div>
+          <button
+            type="button"
+            onClick={handleRefresh}
+            disabled={isLoading}
+            className="inline-flex items-center gap-1.5 px-3 py-1 bg-white dark:bg-[#1E1B18] border border-red-300 dark:border-red-800 hover:bg-red-50 dark:hover:bg-red-950/40 text-red-700 dark:text-red-300 font-semibold rounded-lg shadow-2xs transition self-start sm:self-auto cursor-pointer"
+          >
+            <RefreshCw className={`w-3 h-3 ${isLoading ? 'animate-spin' : ''}`} />
+            <span>Retry</span>
+          </button>
+        </div>
+      )}
+
       {/* Non-Owner Informational Notice */}
-      {!isOwner && (
+      {!isOwner && currentRole && (
         <div className="p-3.5 rounded-xl bg-amber-50/80 dark:bg-amber-950/20 border border-amber-200/80 dark:border-amber-900/30 flex items-start gap-3 text-xs text-amber-800 dark:text-amber-300">
           <Shield className="w-4 h-4 shrink-0 text-amber-600 dark:text-amber-400 mt-0.5" />
           <div className="leading-relaxed">
@@ -401,14 +464,14 @@ export const MembersManagement: React.FC<MembersManagementProps> = ({ onSuccessN
                           : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-300 dark:border-slate-700'
                       }`}
                     >
-                      {member.name ? member.name.charAt(0).toUpperCase() : member.email.charAt(0).toUpperCase()}
+                      {getMemberInitial(member)}
                     </div>
 
                     {/* Name, Email, and You tag */}
                     <div className="min-w-0 space-y-0.5">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="font-semibold text-xs text-[#5A534B] dark:text-[#EAE6E1] truncate">
-                          {member.name || member.email.split('@')[0]}
+                          {getMemberDisplayName(member)}
                         </span>
                         {isCurrentMemberUser && (
                           <span className="text-[10px] font-bold px-1.5 py-0.2 bg-[#D4A373]/20 text-[#8A5A2B] dark:text-[#D4A373] rounded">
@@ -419,7 +482,7 @@ export const MembersManagement: React.FC<MembersManagementProps> = ({ onSuccessN
 
                       <div className="flex items-center gap-1.5 text-[11px] text-[#8B7E74] dark:text-[#A39E93]">
                         <Mail className="w-3 h-3 shrink-0" />
-                        <span className="truncate">{member.email}</span>
+                        <span className="truncate">{member.email || 'No email registered'}</span>
                       </div>
                     </div>
                   </div>

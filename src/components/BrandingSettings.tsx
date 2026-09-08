@@ -15,13 +15,14 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { store } from '../services/store';
-import { WorkspaceBranding, PresetPaletteId } from '../types';
+import { WorkspaceBranding, PresetPaletteId, AccessRole } from '../types';
 import {
   PRESET_PALETTES,
   ColorPalette,
   getPaletteById,
   validateLogoFile,
   sanitizeDisplayName,
+  getDefaultWorkspaceBranding,
   DEFAULT_PALETTE_ID,
   DEFAULT_DISPLAY_NAME,
 } from '../utils/branding';
@@ -33,19 +34,28 @@ interface BrandingSettingsProps {
 
 export const BrandingSettings: React.FC<BrandingSettingsProps> = ({ onSuccessNotice }) => {
   const activeWorkspace = store.getActiveWorkspace();
-  const userRole = store.getUserRole();
+  const [userRole, setUserRole] = useState<AccessRole | null>(() => store.getUserRole());
   const isOwner = userRole === 'owner';
 
-  const [savedBranding, setSavedBranding] = useState<WorkspaceBranding>(() =>
-    store.getWorkspaceBranding()
-  );
+  const [savedBranding, setSavedBranding] = useState<WorkspaceBranding>(() => {
+    try {
+      const b = store.getWorkspaceBranding();
+      return b || getDefaultWorkspaceBranding(activeWorkspace?.name);
+    } catch {
+      return getDefaultWorkspaceBranding(activeWorkspace?.name);
+    }
+  });
 
-  // Form edit states (for live interactive preview)
-  const [displayName, setDisplayName] = useState(savedBranding.displayName || DEFAULT_DISPLAY_NAME);
-  const [paletteId, setPaletteId] = useState<string>(savedBranding.paletteId || DEFAULT_PALETTE_ID);
-  const [logoUrl, setLogoUrl] = useState<string | undefined>(savedBranding.logoUrl);
+  // Form edit states (for live interactive preview with safe fallbacks)
+  const [displayName, setDisplayName] = useState(
+    savedBranding?.displayName || activeWorkspace?.name || DEFAULT_DISPLAY_NAME
+  );
+  const [paletteId, setPaletteId] = useState<string>(
+    savedBranding?.paletteId || DEFAULT_PALETTE_ID
+  );
+  const [logoUrl, setLogoUrl] = useState<string | undefined>(savedBranding?.logoUrl);
   const [logoStoragePath, setLogoStoragePath] = useState<string | undefined>(
-    savedBranding.logoStoragePath
+    savedBranding?.logoStoragePath
   );
 
   const [pendingLogoFile, setPendingLogoFile] = useState<File | null>(null);
@@ -61,16 +71,23 @@ export const BrandingSettings: React.FC<BrandingSettingsProps> = ({ onSuccessNot
 
   // Check if form differs from persisted state
   const isDirty =
-    displayName !== savedBranding.displayName ||
-    paletteId !== savedBranding.paletteId ||
-    logoUrl !== savedBranding.logoUrl ||
+    displayName !== (savedBranding?.displayName || DEFAULT_DISPLAY_NAME) ||
+    paletteId !== (savedBranding?.paletteId || DEFAULT_PALETTE_ID) ||
+    logoUrl !== savedBranding?.logoUrl ||
     pendingLogoFile !== null;
 
-  // Keep savedBranding in sync if store updates externally
+  // Keep savedBranding and userRole in sync if store updates externally
   useEffect(() => {
     const unsub = store.subscribe(() => {
-      const current = store.getWorkspaceBranding();
-      setSavedBranding(current);
+      setUserRole(store.getUserRole());
+      try {
+        const current = store.getWorkspaceBranding();
+        if (current) {
+          setSavedBranding(current);
+        }
+      } catch (err) {
+        console.warn('Workspace branding sync notice:', err);
+      }
     });
     return () => unsub();
   }, []);
