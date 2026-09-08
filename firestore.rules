@@ -1,52 +1,172 @@
 rules_version = '2';
 
+/**
+ * Sunny Sweets - Phase 0 Final Production Security Rules
+ *
+ * ZERO-TRUST MULTI-TENANT SPECIFICATION:
+ * 1. Zero access for unauthenticated requests.
+ * 2. Zero production access for authenticated non-members.
+ * 3. Strict UID-based membership (workspaces/{wsId}/members/{uid}).
+ * 4. Zero self-enrollment (only existing workspace owner can manage members).
+ * 5. workspaceId is strictly required on all production writes.
+ * 6. workspaceId is strictly immutable on all updates.
+ * 7. Zero email-based authorization (no ownerEmail claims).
+ * 8. Zero workspace-code authorization.
+ * 9. Explicit global catch-all deny.
+ */
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // --- Strict UID-Based Authentication & Membership Helpers ---
     function isSignedIn() {
-      return request.auth != null;
+      return request.auth != null && request.auth.uid != null;
     }
 
-    // Default deny catch-all
+    function isWorkspaceMember(workspaceId) {
+      return isSignedIn() && exists(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid));
+    }
+
+    function getMemberRole(workspaceId) {
+      return exists(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid))
+        ? get(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)).data.role
+        : null;
+    }
+
+    function isWorkspaceOwner(workspaceId) {
+      return isSignedIn() && getMemberRole(workspaceId) == 'owner';
+    }
+
+    function isWorkspaceEditor(workspaceId) {
+      return isSignedIn() && (getMemberRole(workspaceId) == 'editor' || getMemberRole(workspaceId) == 'owner');
+    }
+
+    // --- Workspaces & Members Subcollections ---
+    match /workspaces/{workspaceId} {
+      allow read: if isWorkspaceMember(workspaceId);
+      allow create: if isSignedIn() && request.resource.data.ownerId == request.auth.uid;
+      allow update: if isWorkspaceOwner(workspaceId) && request.resource.data.ownerId == resource.data.ownerId;
+      allow delete: if isWorkspaceOwner(workspaceId);
+
+      // Members subcollection: strictly UID-based, only existing owner can manage
+      match /members/{memberId} {
+        allow read: if isWorkspaceMember(workspaceId);
+        allow create, update, delete: if isWorkspaceOwner(workspaceId);
+      }
+    }
+
+    // --- Recipes Collection ---
+    match /recipes/{recipeId} {
+      allow read: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        isWorkspaceMember(resource.data.workspaceId);
+
+      allow create: if isSignedIn() &&
+        request.resource.data.workspaceId != null &&
+        request.resource.data.workspaceId is string &&
+        isWorkspaceEditor(request.resource.data.workspaceId);
+
+      allow update: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        request.resource.data.workspaceId == resource.data.workspaceId &&
+        isWorkspaceEditor(resource.data.workspaceId);
+
+      allow delete: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        isWorkspaceEditor(resource.data.workspaceId);
+    }
+
+    // --- Presets Collection ---
+    match /presets/{presetId} {
+      allow read: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        isWorkspaceMember(resource.data.workspaceId);
+
+      allow create: if isSignedIn() &&
+        request.resource.data.workspaceId != null &&
+        request.resource.data.workspaceId is string &&
+        isWorkspaceEditor(request.resource.data.workspaceId);
+
+      allow update: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        request.resource.data.workspaceId == resource.data.workspaceId &&
+        isWorkspaceEditor(resource.data.workspaceId);
+
+      allow delete: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        isWorkspaceEditor(resource.data.workspaceId);
+    }
+
+    // --- Mixers Collection ---
+    match /mixers/{mixerId} {
+      allow read: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        isWorkspaceMember(resource.data.workspaceId);
+
+      allow create: if isSignedIn() &&
+        request.resource.data.workspaceId != null &&
+        request.resource.data.workspaceId is string &&
+        isWorkspaceEditor(request.resource.data.workspaceId);
+
+      allow update: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        request.resource.data.workspaceId == resource.data.workspaceId &&
+        isWorkspaceEditor(resource.data.workspaceId);
+
+      allow delete: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        isWorkspaceEditor(resource.data.workspaceId);
+    }
+
+    // --- History Collection ---
+    match /history/{historyId} {
+      allow read: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        isWorkspaceMember(resource.data.workspaceId);
+
+      allow create: if isSignedIn() &&
+        request.resource.data.workspaceId != null &&
+        request.resource.data.workspaceId is string &&
+        isWorkspaceEditor(request.resource.data.workspaceId);
+
+      allow update: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        request.resource.data.workspaceId == resource.data.workspaceId &&
+        isWorkspaceEditor(resource.data.workspaceId);
+
+      allow delete: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        isWorkspaceEditor(resource.data.workspaceId);
+    }
+
+    // --- Master Ingredients Collection ---
+    match /master_ingredients/{ingredientId} {
+      allow read: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        isWorkspaceMember(resource.data.workspaceId);
+
+      allow create: if isSignedIn() &&
+        request.resource.data.workspaceId != null &&
+        request.resource.data.workspaceId is string &&
+        isWorkspaceEditor(request.resource.data.workspaceId);
+
+      allow update: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        request.resource.data.workspaceId == resource.data.workspaceId &&
+        isWorkspaceEditor(resource.data.workspaceId);
+
+      allow delete: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        isWorkspaceEditor(resource.data.workspaceId);
+    }
+
+    // --- User Settings (Private to authenticated UID) ---
+    match /settings/{userId} {
+      allow read, write: if isSignedIn() && request.auth.uid == userId;
+    }
+
+    // --- Zero-Trust Global Catch-All Deny ---
     match /{document=**} {
       allow read, write: if false;
     }
-
-    // Recipes collection
-    match /recipes/{recipeId} {
-      allow read, write: if isSignedIn();
-    }
-
-    // Presets collection
-    match /presets/{presetId} {
-      allow read, write: if isSignedIn();
-    }
-
-    // Mixers collection
-    match /mixers/{mixerId} {
-      allow read, write: if isSignedIn();
-    }
-
-    // History collection
-    match /history/{historyId} {
-      allow read, write: if isSignedIn();
-    }
-
-    // Master Ingredients collection
-    match /master_ingredients/{ingredientId} {
-      allow read, write: if isSignedIn();
-    }
-
-    // User Settings collection
-    match /settings/{userId} {
-      allow read, write: if isSignedIn();
-    }
-
-    // Workspaces collection
-    match /workspaces/{workspaceId} {
-      allow read, write: if isSignedIn();
-    }
   }
 }
-
-

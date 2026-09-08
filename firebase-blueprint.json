@@ -2,9 +2,10 @@
   "entities": {
     "recipes": {
       "title": "Recipe",
-      "description": "Bakery recipes with base yields and ingredients",
+      "description": "Bakery recipes with base yields, formulations, and ingredients bound to a workspace",
       "type": "object",
       "properties": {
+        "workspaceId": { "type": "string" },
         "userId": { "type": "string" },
         "name": { "type": "string" },
         "description": { "type": "string" },
@@ -15,13 +16,14 @@
         "createdAt": { "type": "string" },
         "updatedAt": { "type": "string" }
       },
-      "required": ["userId", "name", "batchYieldQuantity", "batchYieldUnit"]
+      "required": ["workspaceId", "name", "batchYieldQuantity", "batchYieldUnit"]
     },
     "presets": {
       "title": "Production Preset",
-      "description": "Reusable product packaging and item weight presets",
+      "description": "Reusable product packaging and item weight presets bound to a workspace",
       "type": "object",
       "properties": {
+        "workspaceId": { "type": "string" },
         "userId": { "type": "string" },
         "name": { "type": "string" },
         "finishedWeight": { "type": "number" },
@@ -30,25 +32,27 @@
         "unitName": { "type": "string" },
         "expectedYield": { "type": "string" }
       },
-      "required": ["userId", "name", "finishedWeight", "weightUnit", "quantityPerUnit"]
+      "required": ["workspaceId", "name", "finishedWeight", "weightUnit", "quantityPerUnit"]
     },
     "mixers": {
       "title": "Mixer Capacity",
-      "description": "Equipment mixer details and safe batch capacities",
+      "description": "Equipment mixer details and safe batch capacities bound to a workspace",
       "type": "object",
       "properties": {
+        "workspaceId": { "type": "string" },
         "userId": { "type": "string" },
         "name": { "type": "string" },
         "maxWeight": { "type": "number" },
         "weightUnit": { "type": "string" }
       },
-      "required": ["userId", "name", "maxWeight", "weightUnit"]
+      "required": ["workspaceId", "name", "maxWeight", "weightUnit"]
     },
     "history": {
       "title": "Production History",
-      "description": "Saved production calculations and batch sheets",
+      "description": "Saved production calculations and batch sheets bound to a workspace",
       "type": "object",
       "properties": {
+        "workspaceId": { "type": "string" },
         "userId": { "type": "string" },
         "recipeId": { "type": "string" },
         "recipeName": { "type": "string" },
@@ -57,11 +61,27 @@
         "scalingMultiplier": { "type": "number" },
         "status": { "type": "string" }
       },
-      "required": ["userId", "recipeName", "calculatedAt"]
+      "required": ["workspaceId", "recipeName", "calculatedAt"]
+    },
+    "master_ingredients": {
+      "title": "Master Ingredient",
+      "description": "Master pantry ingredients and specifications bound to a workspace",
+      "type": "object",
+      "properties": {
+        "workspaceId": { "type": "string" },
+        "userId": { "type": "string" },
+        "name": { "type": "string" },
+        "category": { "type": "string" },
+        "defaultUnit": { "type": "string" },
+        "defaultWastePercent": { "type": "number" },
+        "subIngredients": { "type": "string" },
+        "allergens": { "type": "string" }
+      },
+      "required": ["workspaceId", "name"]
     },
     "settings": {
       "title": "User Settings",
-      "description": "Business measurement and UI preferences",
+      "description": "Individual user preferences and application configuration",
       "type": "object",
       "properties": {
         "userId": { "type": "string" },
@@ -74,20 +94,76 @@
       "required": ["userId", "defaultWeightUnit"]
     },
     "workspaces": {
-      "title": "Workspace & Access Group",
-      "description": "Shared workspace for team members and groups with access",
+      "title": "Workspace",
+      "description": "Bakery workspace entity with ownership and configuration",
       "type": "object",
       "properties": {
         "id": { "type": "string" },
         "name": { "type": "string" },
         "ownerId": { "type": "string" },
+        "ownerEmail": { "type": "string" },
+        "code": { "type": "string" },
         "members": { "type": "array" },
         "groups": { "type": "array" },
-        "code": { "type": "string" },
+        "branding": {
+          "type": "object",
+          "properties": {
+            "displayName": { "type": "string" },
+            "logoUrl": { "type": "string" },
+            "logoStoragePath": { "type": "string" },
+            "paletteId": { "type": "string" }
+          }
+        },
         "createdAt": { "type": "string" },
         "updatedAt": { "type": "string" }
       },
       "required": ["id", "name", "ownerId"]
+    },
+    "workspace_members": {
+      "title": "Workspace Member",
+      "description": "Membership document enforcing zero-trust role-based access control",
+      "type": "object",
+      "properties": {
+        "role": { "type": "string", "enum": ["owner", "editor", "viewer"] },
+        "email": { "type": "string" },
+        "name": { "type": "string" },
+        "addedAt": { "type": "string" }
+      },
+      "required": ["role", "email"]
+    }
+  },
+  "firestore": {
+    "/workspaces/{workspaceId}": {
+      "schema": "workspaces",
+      "description": "Workspace root document holding metadata and legacy member arrays"
+    },
+    "/workspaces/{workspaceId}/members/{memberId}": {
+      "schema": "workspace_members",
+      "description": "Granular user membership document for secure zero-trust RBAC"
+    },
+    "/recipes/{recipeId}": {
+      "schema": "recipes",
+      "description": "Workspace-isolated recipes and formulation data"
+    },
+    "/presets/{presetId}": {
+      "schema": "presets",
+      "description": "Workspace-isolated packaging presets"
+    },
+    "/mixers/{mixerId}": {
+      "schema": "mixers",
+      "description": "Workspace-isolated mixing equipment"
+    },
+    "/history/{historyId}": {
+      "schema": "history",
+      "description": "Workspace-isolated batch production logs"
+    },
+    "/master_ingredients/{ingredientId}": {
+      "schema": "master_ingredients",
+      "description": "Workspace-isolated master pantry ingredients"
+    },
+    "/settings/{userId}": {
+      "schema": "settings",
+      "description": "User-private preferences and configurations"
     }
   }
 }

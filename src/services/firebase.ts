@@ -9,6 +9,14 @@ import {
   signOut,
 } from 'firebase/auth';
 import { getFirestore, Firestore } from 'firebase/firestore';
+import {
+  getStorage,
+  FirebaseStorage,
+  ref as storageRef,
+  uploadBytes,
+  getDownloadURL,
+  deleteObject,
+} from 'firebase/storage';
 import firebaseConfigData from '../../firebase-applet-config.json';
 
 const firebaseConfig = {
@@ -32,6 +40,7 @@ export const db: Firestore = getFirestore(
   app,
   firebaseConfigData.firestoreDatabaseId || '(default)'
 );
+export const storage: FirebaseStorage = getStorage(app);
 
 export enum OperationType {
   CREATE = 'create',
@@ -115,6 +124,49 @@ export async function logoutUser(): Promise<void> {
     await signOut(auth);
   } catch (err) {
     console.error('Sign Out Error:', err);
+  }
+}
+
+/**
+ * Upload workspace logo to workspace-specific storage path:
+ * workspace-logos/{workspaceId}/logo_{timestamp}.{ext}
+ */
+export async function uploadWorkspaceLogoToStorage(
+  workspaceId: string,
+  file: File
+): Promise<{ downloadUrl: string; storagePath: string }> {
+  if (!auth.currentUser) {
+    throw new Error('Authentication required to upload workspace logos.');
+  }
+
+  const rawExt = file.name.split('.').pop()?.toLowerCase() || 'png';
+  const cleanExt = rawExt === 'jpeg' ? 'jpg' : rawExt;
+  const storagePath = `workspace-logos/${workspaceId}/logo_${Date.now()}.${cleanExt}`;
+  const fileRef = storageRef(storage, storagePath);
+
+  const snapshot = await uploadBytes(fileRef, file, {
+    contentType: file.type,
+    customMetadata: {
+      workspaceId,
+      uploadedBy: auth.currentUser.uid,
+      uploadedAt: new Date().toISOString(),
+    },
+  });
+
+  const downloadUrl = await getDownloadURL(snapshot.ref);
+  return { downloadUrl, storagePath };
+}
+
+/**
+ * Delete workspace logo from storage if it exists.
+ */
+export async function deleteWorkspaceLogoFromStorage(storagePath: string): Promise<void> {
+  if (!storagePath) return;
+  try {
+    const fileRef = storageRef(storage, storagePath);
+    await deleteObject(fileRef);
+  } catch (err) {
+    console.warn('Workspace logo deletion note (file may already be removed):', err);
   }
 }
 

@@ -13,6 +13,9 @@ import {
   tryConvertToWeight,
   isWeightUnit,
   isVolumeUnit,
+  isButterIngredient,
+  isPeanutButterIngredient,
+  calculatePeanutButterJarsDetail,
   formatQuantity,
 } from './units';
 
@@ -223,10 +226,38 @@ export function calculateProduction(
       ing.densityGramsPerMl
     );
 
-    // Add to total batch weight if weight compatible
+    // Add to total batch weight in canonical grams (before butter display conversion)
     const ingGrams = tryConvertToWeight(requiredQuantity, ing.unit, 'g', ing.densityGramsPerMl);
     if (ingGrams !== null) {
       totalBatchWeightGrams += ingGrams;
+    }
+
+    // Check if ingredient represents Peanut Butter or Butter
+    const isPB = isPeanutButterIngredient(ing.name, recipe.name);
+    const isButter = !isPB && isButterIngredient(ing.name);
+    let finalRequiredQuantity = requiredQuantity;
+    let finalRequiredUnit = ing.unit;
+    let jarsDetail = undefined;
+
+    if (isPB) {
+      // Auto-convert peanut butter to 4-lb jars with 2 decimal points & breakdown note
+      const pbGrams = ingGrams ?? toGrams(requiredQuantity, isWeightUnit(ing.unit) ? ing.unit : 'g');
+      jarsDetail = calculatePeanutButterJarsDetail(pbGrams);
+      finalRequiredQuantity = jarsDetail.jars;
+      finalRequiredUnit = 'jars';
+    } else if (isButter) {
+      const butterInLbs = tryConvertToWeight(
+        requiredQuantity,
+        ing.unit,
+        'lb',
+        ing.densityGramsPerMl ?? 0.911
+      );
+      if (butterInLbs !== null) {
+        finalRequiredQuantity = Number(butterInLbs.toFixed(2));
+        finalRequiredUnit = 'lb';
+      }
+    } else if (finalRequiredUnit.toLowerCase() === 'g') {
+      finalRequiredQuantity = Math.round(finalRequiredQuantity);
     }
 
     return {
@@ -236,11 +267,13 @@ export function calculateProduction(
       baseUnit: ing.unit,
       scaledQuantity,
       wastePercent: ingredientWastePercent,
-      requiredQuantity,
-      requiredUnit: ing.unit,
+      requiredQuantity: finalRequiredQuantity,
+      requiredUnit: finalRequiredUnit,
       convertedQuantityInDefaultUnit: convertedInDefault ?? undefined,
       defaultUnit: defaultWeightUnit,
       notes: ing.notes,
+      isPeanutButter: isPB,
+      jarsDetail,
     };
   });
 
@@ -265,16 +298,40 @@ export function calculateProduction(
   // Calculate per batch amounts if split
   if (suggestedBatches > 1) {
     calculatedIngredients.forEach((ci) => {
-      ci.perBatchQuantity = ci.requiredQuantity / suggestedBatches;
+      const isPB = !!ci.isPeanutButter;
+      const isButter = !isPB && isButterIngredient(ci.name);
+      const rawBatch = ci.requiredQuantity / suggestedBatches;
+
+      if (isPB) {
+        // Calculate per batch peanut butter in jars
+        ci.perBatchQuantity = Number(rawBatch.toFixed(2));
+        if (ci.jarsDetail) {
+          const totalPBGrams = (ci.jarsDetail.fullJars * (4 * 453.59237)) + ci.jarsDetail.remainingGrams;
+          const perBatchGrams = totalPBGrams / suggestedBatches;
+          ci.perBatchJarsDetail = calculatePeanutButterJarsDetail(perBatchGrams);
+        }
+      } else if (isButter) {
+        ci.perBatchQuantity = Number(rawBatch.toFixed(2));
+      } else if (ci.requiredUnit.toLowerCase() === 'g') {
+        ci.perBatchQuantity = Math.round(rawBatch);
+      } else {
+        ci.perBatchQuantity = rawBatch;
+      }
     });
   } else {
     calculatedIngredients.forEach((ci) => {
       ci.perBatchQuantity = ci.requiredQuantity;
+      if (ci.isPeanutButter) {
+        ci.perBatchJarsDetail = ci.jarsDetail;
+      }
     });
   }
 
-  // Display batch weight in requested default unit
-  const displayBatchWeight = fromGrams(totalBatchWeightGrams, defaultWeightUnit);
+  // Display batch weight in requested default unit (rounded if in grams)
+  let displayBatchWeight = fromGrams(totalBatchWeightGrams, defaultWeightUnit);
+  if (defaultWeightUnit === 'g') {
+    displayBatchWeight = Math.round(displayBatchWeight);
+  }
 
   return {
     recipe,

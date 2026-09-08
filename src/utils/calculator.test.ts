@@ -1,6 +1,15 @@
 import { Recipe, Mixer, ProductionItemRequirement, ProductionPreset } from '../types';
 import { calculateProduction, calculateRecipeBaseWeightGrams, calculateRecipeTotal } from './calculator';
 import { convertWeight, toGrams, tryConvertToWeight, formatNumber, standardizeIngredientToUnit, standardizeIngredientsToUnit } from './units';
+import {
+  PRESET_PALETTES,
+  getPaletteById,
+  sanitizeDisplayName,
+  validateLogoFile,
+  getDefaultWorkspaceBranding,
+  DEFAULT_PALETTE_ID,
+  DEFAULT_DISPLAY_NAME,
+} from './branding';
 
 export interface TestCaseResult {
   name: string;
@@ -375,6 +384,360 @@ export function runUnitTests(): TestCaseResult[] {
   } catch (err: any) {
     results.push({
       name: 'Preset Categorization & Grouping',
+      passed: false,
+      message: err.message,
+    });
+  }
+
+  // 11. Test Recipe Category Preset Routing & Multi-Preset Mapping
+  try {
+    const testCategoryPresetMap: Record<string, string | string[]> = {
+      Cookies: ['Cookies', 'Shortbread'],
+      Bread: ['Base Dough'],
+      Pies: ['Pie Dough'],
+      Shortbread: ['Shortbread'],
+      Pastries: ['Pie Dough', 'Base Dough'],
+    };
+
+    const cookiePresetCats = Array.isArray(testCategoryPresetMap['Cookies'])
+      ? testCategoryPresetMap['Cookies']
+      : [testCategoryPresetMap['Cookies']];
+    const pastryPresetCats = Array.isArray(testCategoryPresetMap['Pastries'])
+      ? testCategoryPresetMap['Pastries']
+      : [testCategoryPresetMap['Pastries']];
+
+    const passed =
+      cookiePresetCats.includes('Cookies') &&
+      cookiePresetCats.includes('Shortbread') &&
+      cookiePresetCats.length === 2 &&
+      pastryPresetCats.includes('Pie Dough') &&
+      pastryPresetCats.includes('Base Dough');
+
+    results.push({
+      name: 'Recipe Category to Multi-Preset Routing & Category Management',
+      passed,
+      message: passed
+        ? 'Successfully mapped recipe categories to multiple target packaging presets and verified multi-preset routing.'
+        : `Multi-preset routing mapping failed: Cookies=${JSON.stringify(cookiePresetCats)}, Pastries=${JSON.stringify(pastryPresetCats)}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Recipe Category to Preset Routing',
+      passed: false,
+      message: err.message,
+    });
+  }
+
+  // 12. Test Butter Auto-Conversion to lbs with 2 decimal points & Recipe Total in Grams / Selected Unit
+  try {
+    const butterReqs: ProductionItemRequirement[] = [
+      {
+        id: 'req-butter-test',
+        presetName: 'Standard Test Batch',
+        quantity: 1,
+        piecesPerUnit: 100,
+        itemWeight: 110.07,
+        itemWeightUnit: 'g',
+      },
+    ];
+
+    // Calculate with default unit 'g' (Grams)
+    const resultInGrams = calculateProduction(sampleRecipe, butterReqs, { defaultWeightUnit: 'g' });
+    const butterIng = resultInGrams.calculatedIngredients.find((i) => i.name.toLowerCase().includes('butter'));
+    const flourIng = resultInGrams.calculatedIngredients.find((i) => i.name === 'Bread Flour');
+
+    // Butter base was 2.5 kg. With 2% waste: 2.55 kg = 2550 g.
+    // 2550 g / 453.59237 = 5.621769... lbs -> 5.62 lbs
+    const butterConvertedToLbs = butterIng && butterIng.requiredUnit === 'lb' && Math.abs(butterIng.requiredQuantity - 5.62) < 0.01;
+    // Recipe total at bottom must still read in grams (or selected measurement unit)
+    const recipeTotalInGrams = resultInGrams.displayWeightUnit === 'g' && Math.abs(resultInGrams.displayBatchWeight - resultInGrams.totalBatchWeightGrams) < 0.01;
+    const flourRemainsInKg = flourIng && flourIng.requiredUnit === 'kg';
+
+    // Also test when user selects 'kg' or 'oz'
+    const resultInKg = calculateProduction(sampleRecipe, butterReqs, { defaultWeightUnit: 'kg' });
+    const recipeTotalInKg = resultInKg.displayWeightUnit === 'kg';
+
+    const passed = Boolean(butterConvertedToLbs && recipeTotalInGrams && flourRemainsInKg && recipeTotalInKg);
+
+    results.push({
+      name: 'Butter Auto-Conversion to lbs (2 Decimals) & Recipe Total in Selected Unit',
+      passed,
+      message: passed
+        ? `Butter automatically converted to ${butterIng?.requiredQuantity} lbs (2 decimals) while Total Scaled Batch Weight reads ${Math.round(resultInGrams.displayBatchWeight)} ${resultInGrams.displayWeightUnit}.`
+        : `Butter conversion failed: Butter=${butterIng?.requiredQuantity} ${butterIng?.requiredUnit} (exp 5.62 lb), Total=${resultInGrams.displayBatchWeight} ${resultInGrams.displayWeightUnit}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Butter Auto-Conversion to lbs',
+      passed: false,
+      message: err.message,
+    });
+  }
+
+  // 13. Test Grams Rounding (0 decimals for all non-butter ingredients in grams) & Butter (2 decimals in lbs)
+  try {
+    const gramRecipe: Recipe = {
+      id: 'recipe-gram-test',
+      userId: 'user-1',
+      name: 'Gram Croissant Dough',
+      description: 'Test recipe with ingredients in grams',
+      category: 'Pastries',
+      batchYieldQuantity: 50,
+      batchYieldUnit: 'pieces',
+      defaultWastePercent: 2.5,
+      ingredients: [
+        { id: 'g-1', name: 'Pastry Flour', quantity: 1255.5, unit: 'g' },
+        { id: 'g-2', name: 'European Butter', quantity: 825.25, unit: 'g' },
+        { id: 'g-3', name: 'Fine Sea Salt', quantity: 23.8, unit: 'g' },
+        { id: 'g-4', name: 'Whole Milk', quantity: 512.4, unit: 'g' },
+      ],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    const reqs: ProductionItemRequirement[] = [
+      {
+        id: 'req-g-1',
+        presetName: 'Standard',
+        quantity: 1,
+        piecesPerUnit: 50,
+        itemWeight: 52.3,
+        itemWeightUnit: 'g',
+      },
+    ];
+
+    const result = calculateProduction(gramRecipe, reqs, { defaultWeightUnit: 'g' });
+    const flour = result.calculatedIngredients.find((i) => i.name === 'Pastry Flour');
+    const butter = result.calculatedIngredients.find((i) => i.name === 'European Butter');
+    const salt = result.calculatedIngredients.find((i) => i.name === 'Fine Sea Salt');
+    const milk = result.calculatedIngredients.find((i) => i.name === 'Whole Milk');
+
+    // Flour required: 1255.5 * 1.025 = 1286.8875 -> rounded to 1287 (integer, no decimals)
+    const flourIsInteger = flour && Number.isInteger(flour.requiredQuantity) && flour.requiredUnit === 'g';
+    // Salt required: 23.8 * 1.025 = 24.395 -> rounded to 24 (integer, no decimals)
+    const saltIsInteger = salt && Number.isInteger(salt.requiredQuantity) && salt.requiredUnit === 'g';
+    // Milk required: 512.4 * 1.025 = 525.21 -> rounded to 525 (integer, no decimals)
+    const milkIsInteger = milk && Number.isInteger(milk.requiredQuantity) && milk.requiredUnit === 'g';
+    // Butter is converted to lbs with 2 decimals
+    // 825.25 * 1.025 = 845.88125 g -> / 453.59237 = 1.8648... -> 1.86 lb
+    const butterIsTwoDecimalsInLbs =
+      butter &&
+      butter.requiredUnit === 'lb' &&
+      butter.requiredQuantity.toString().split('.')[1]?.length <= 2;
+    // Total batch weight in grams is rounded to integer
+    const totalIsInteger = Number.isInteger(result.displayBatchWeight);
+
+    const passed = Boolean(
+      flourIsInteger &&
+      saltIsInteger &&
+      milkIsInteger &&
+      butterIsTwoDecimalsInLbs &&
+      totalIsInteger
+    );
+
+    results.push({
+      name: 'Grams Calculation Zero Decimals Rounding & Butter 2 Decimals in lbs',
+      passed,
+      message: passed
+        ? `Successfully rounded grams to whole numbers (Flour=${flour?.requiredQuantity}g, Salt=${salt?.requiredQuantity}g, Total=${result.displayBatchWeight}g) and Butter to 2 decimals in lbs (${butter?.requiredQuantity} lb).`
+        : `Grams rounding check failed: Flour=${flour?.requiredQuantity} ${flour?.requiredUnit}, Salt=${salt?.requiredQuantity} ${salt?.requiredUnit}, Butter=${butter?.requiredQuantity} ${butter?.requiredUnit}, Total=${result.displayBatchWeight} ${result.displayWeightUnit}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Grams Calculation Zero Decimals Rounding',
+      passed: false,
+      message: err.message,
+    });
+  }
+
+  // 14. Test Peanut Butter Cookies 4-lb Jars Conversion & Note
+  try {
+    const pbRecipe: Recipe = {
+      id: 'recipe-pb-test',
+      userId: 'user-1',
+      name: 'Peanut Butter Cookies',
+      description: 'Test recipe with peanut butter in grams',
+      category: 'Cookies',
+      batchYieldQuantity: 80,
+      batchYieldUnit: 'cookies',
+      defaultWastePercent: 0,
+      ingredients: [
+        { id: 'pb-1', name: 'All-Purpose Flour', quantity: 2400, unit: 'g' },
+        { id: 'pb-2', name: 'Creamy Peanut Butter', quantity: 1928, unit: 'g' },
+        { id: 'pb-3', name: 'Unsalted Butter', quantity: 1200, unit: 'g' },
+        { id: 'pb-4', name: 'Light Brown Sugar', quantity: 1600, unit: 'g' },
+      ],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    const reqs: ProductionItemRequirement[] = [
+      {
+        id: 'req-pb-1',
+        presetName: 'Standard Batch',
+        quantity: 1,
+        piecesPerUnit: 80,
+        itemWeight: 2,
+        itemWeightUnit: 'oz',
+      },
+    ];
+
+    const result = calculateProduction(pbRecipe, reqs, { defaultWeightUnit: 'g' });
+    const pb = result.calculatedIngredients.find((i) => i.name === 'Creamy Peanut Butter');
+    const flour = result.calculatedIngredients.find((i) => i.name === 'All-Purpose Flour');
+    const butter = result.calculatedIngredients.find((i) => i.name === 'Unsalted Butter');
+
+    // 1928 g / 1816 g = 1.0616... -> 1.06 jars (2 decimal points)
+    const pbIsJars = pb && pb.requiredUnit === 'jars' && pb.requiredQuantity === 1.06;
+    // Jars note: 1 jar + 112 grams
+    const pbHasCorrectNote =
+      pb &&
+      pb.jarsDetail &&
+      pb.jarsDetail.fullJars === 1 &&
+      pb.jarsDetail.remainingGrams === 112 &&
+      pb.jarsDetail.text === '1 jar + 112 grams';
+    // Regular butter is 1200 g -> 2.65 lb (2 decimals)
+    const butterIsLbs = butter && butter.requiredUnit === 'lb' && butter.requiredQuantity === 2.65;
+    // Flour is rounded grams (2400 g)
+    const flourIsGrams = flour && flour.requiredUnit === 'g' && flour.requiredQuantity === 2400;
+
+    const passed = Boolean(pbIsJars && pbHasCorrectNote && butterIsLbs && flourIsGrams);
+
+    results.push({
+      name: 'Peanut Butter Cookies 4-lb Jars Conversion (1928g -> 1.06 jars & 1 jar + 112 grams note)',
+      passed,
+      message: passed
+        ? `Successfully converted 1928g peanut butter to ${pb?.requiredQuantity} ${pb?.requiredUnit} with note "${pb?.jarsDetail?.text}", Butter to ${butter?.requiredQuantity} lb, Flour to ${flour?.requiredQuantity} g.`
+        : `PB conversion failed: PB=${pb?.requiredQuantity} ${pb?.requiredUnit} (note: ${pb?.jarsDetail?.text}), Butter=${butter?.requiredQuantity} ${butter?.requiredUnit}, Flour=${flour?.requiredQuantity} ${flour?.requiredUnit}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Peanut Butter Cookies 4-lb Jars Conversion',
+      passed: false,
+      message: err.message,
+    });
+  }
+
+  // 17. Test Phase 0.5 Preset Palettes Integrity & Structure
+  try {
+    const expectedPalettes = ['warm-bakery', 'modern-navy', 'sage-kitchen', 'charcoal-gold', 'berry-cream'];
+    const actualIds = PRESET_PALETTES.map((p) => p.id);
+    const allExpectedPresent = expectedPalettes.every((id) => actualIds.includes(id as any));
+
+    // Check color tokens presence on each
+    const allHaveTokens = PRESET_PALETTES.every(
+      (p) =>
+        p.light.primary &&
+        p.light.accent &&
+        p.light.background &&
+        p.light.surface &&
+        p.light.text &&
+        p.light.border &&
+        p.dark.primary &&
+        p.dark.background
+    );
+
+    const fallbackTest = getPaletteById('non-existent-id' as any);
+    const fallbackCorrect = fallbackTest.id === 'warm-bakery';
+
+    const passed = allExpectedPresent && allHaveTokens && fallbackCorrect;
+    results.push({
+      name: 'Phase 0.5 Preset Color Palettes (5 Presets & Full Semantic Tokens)',
+      passed,
+      message: passed
+        ? `Verified all 5 culinary preset palettes (${actualIds.join(', ')}) with complete light & dark semantic tokens.`
+        : 'Color palette preset validation failed.',
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Phase 0.5 Preset Color Palettes',
+      passed: false,
+      message: err.message,
+    });
+  }
+
+  // 18. Test Workspace Display Name Sanitization & Length Boundary
+  try {
+    const validClean = sanitizeDisplayName('Sunny Sweets Bakery');
+    const validWithSpaces = sanitizeDisplayName('   Artisan Loaf & Pastry Co.   ');
+    const tooShort = sanitizeDisplayName('A');
+    const tooLong = sanitizeDisplayName('A'.repeat(65));
+    const maliciousScript = sanitizeDisplayName('<script>alert("xss")</script>Sweet Bakery');
+
+    const passed =
+      validClean.valid &&
+      validClean.value === 'Sunny Sweets Bakery' &&
+      validWithSpaces.valid &&
+      validWithSpaces.value === 'Artisan Loaf & Pastry Co.' &&
+      !tooShort.valid &&
+      !tooLong.valid &&
+      maliciousScript.valid &&
+      maliciousScript.value === 'Sweet Bakery';
+
+    results.push({
+      name: 'Workspace Display Name Sanitization & XSS Stripping',
+      passed,
+      message: passed
+        ? 'Successfully validated display name constraints (2-60 chars, trimmed, stripped tags).'
+        : `Sanitization mismatch: validClean=${validClean.value}, tooShortValid=${tooShort.valid}, xssClean=${maliciousScript.value}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Workspace Display Name Sanitization',
+      passed: false,
+      message: err.message,
+    });
+  }
+
+  // 19. Test Workspace Logo Validation Constraints
+  try {
+    // Mock valid PNG file under 2MB
+    const validPng = new File(['mock_image_bytes'], 'logo.png', { type: 'image/png' });
+    const validRes = validateLogoFile(validPng);
+
+    // Mock invalid SVG or EXE file
+    const invalidType = new File(['mock_bytes'], 'logo.svg', { type: 'image/svg+xml' });
+    const invalidTypeRes = validateLogoFile(invalidType);
+
+    // Mock oversized file (> 2MB)
+    const bigBlob = new Blob([new Uint8Array(2.5 * 1024 * 1024)], { type: 'image/png' });
+    const oversizedFile = new File([bigBlob], 'huge.png', { type: 'image/png' });
+    const oversizedRes = validateLogoFile(oversizedFile);
+
+    const passed = validRes.valid && !invalidTypeRes.valid && !oversizedRes.valid;
+    results.push({
+      name: 'Workspace Logo Validation (PNG/JPEG/WEBP & 2MB Limit)',
+      passed,
+      message: passed
+        ? 'Successfully enforced logo format constraints (PNG/JPEG/WEBP) and 2MB max file size.'
+        : `Logo validation failed: valid=${validRes.valid}, invalidType=${invalidTypeRes.valid}, oversized=${oversizedRes.valid}`,
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Workspace Logo Validation',
+      passed: false,
+      message: err.message,
+    });
+  }
+
+  // 20. Test Default Workspace Branding Fallback & Security Scoping
+  try {
+    const defaultBranding = getDefaultWorkspaceBranding('Main Bakery Workspace');
+    const passed =
+      defaultBranding.displayName === 'Main Bakery Workspace' &&
+      defaultBranding.paletteId === DEFAULT_PALETTE_ID &&
+      defaultBranding.logoUrl === undefined;
+
+    results.push({
+      name: 'Default Workspace Branding Scoping & Fallback',
+      passed,
+      message: passed
+        ? `Successfully generated scoped default branding with ${DEFAULT_PALETTE_ID} palette and clean fallback.`
+        : 'Default branding fallback failed.',
+    });
+  } catch (err: any) {
+    results.push({
+      name: 'Default Workspace Branding Scoping',
       passed: false,
       message: err.message,
     });

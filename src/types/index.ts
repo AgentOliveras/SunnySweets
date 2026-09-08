@@ -5,6 +5,7 @@ export type MeasurementUnit = WeightUnit | VolumeUnit | DiscreteUnit | string;
 
 export interface MasterIngredient {
   id: string;
+  workspaceId?: string;
   userId?: string;
   name: string;
   subIngredients?: string; // Ingredients/components of this ingredient
@@ -33,6 +34,7 @@ export interface Ingredient {
 
 export interface Recipe {
   id: string;
+  workspaceId?: string;
   userId: string;
   name: string;
   description: string;
@@ -57,6 +59,7 @@ export type DefaultPresetCategory = (typeof DEFAULT_PRESET_CATEGORIES)[number];
 
 export interface ProductionPreset {
   id: string;
+  workspaceId?: string;
   userId: string;
   name: string;
   category?: string; // e.g. 'Cookies', 'Pie Dough', 'Base Dough', 'Shortbread'
@@ -71,6 +74,7 @@ export interface ProductionPreset {
 
 export interface Mixer {
   id: string;
+  workspaceId?: string;
   userId: string;
   name: string;
   maxWeight: number;
@@ -89,6 +93,13 @@ export interface ProductionItemRequirement {
   itemWeightUnit: WeightUnit; // e.g., 'oz'
 }
 
+export interface PeanutButterJarsDetail {
+  jars: number;
+  fullJars: number;
+  remainingGrams: number;
+  text: string;
+}
+
 export interface CalculatedIngredient {
   id: string;
   name: string;
@@ -102,6 +113,9 @@ export interface CalculatedIngredient {
   defaultUnit?: WeightUnit;
   notes?: string;
   perBatchQuantity?: number;
+  isPeanutButter?: boolean;
+  jarsDetail?: PeanutButterJarsDetail;
+  perBatchJarsDetail?: PeanutButterJarsDetail;
 }
 
 export interface CalculationResult {
@@ -126,6 +140,7 @@ export interface CalculationResult {
 
 export interface ProductionHistoryEntry {
   id: string;
+  workspaceId?: string;
   userId: string;
   recipeId: string;
   recipeName: string;
@@ -149,6 +164,14 @@ export interface ProductionHistoryEntry {
   notes?: string;
 }
 
+export interface WorkspaceMemberDoc {
+  id: string; // member uid
+  role: AccessRole;
+  email: string;
+  name?: string;
+  addedAt: string;
+}
+
 export interface UserSettings {
   userId: string;
   defaultWeightUnit: WeightUnit;
@@ -156,6 +179,8 @@ export interface UserSettings {
   decimalPlaces?: number; // 0 for no decimals (rounded whole numbers), 1, 2, 3, 4, etc.
   theme: 'light' | 'dark' | 'system';
   businessName?: string;
+  categoryPresetMap?: Record<string, string | string[]>; // Recipe category -> Preset categories mapping (e.g. 'Cookies' -> ['Cookies', 'Shortbread'])
+  recipeCategories?: string[]; // User-managed list of recipe categories
   activeWorkspaceId?: string;
   workspaceName?: string;
   updatedAt?: string;
@@ -177,6 +202,20 @@ export interface AccessGroup {
   role: AccessRole;
 }
 
+export type PresetPaletteId =
+  | 'warm-bakery'
+  | 'modern-navy'
+  | 'sage-kitchen'
+  | 'charcoal-gold'
+  | 'berry-cream';
+
+export interface WorkspaceBranding {
+  displayName: string;
+  logoUrl?: string;
+  logoStoragePath?: string;
+  paletteId: PresetPaletteId | string;
+}
+
 export interface Workspace {
   id: string;
   name: string;
@@ -185,6 +224,7 @@ export interface Workspace {
   code: string;
   members: AccessMember[];
   groups: AccessGroup[];
+  branding?: WorkspaceBranding;
   createdAt: string;
   updatedAt: string;
 }

@@ -1,10 +1,17 @@
 import jsPDF from 'jspdf';
 import { CalculationResult, ProductionHistoryEntry } from '../types';
-import { formatNumber, getUnitLabel } from './units';
+import { formatNumber, getUnitLabel, isButterIngredient, isPeanutButterIngredient, getDisplayDecimals } from './units';
+import { getPaletteById, hexToRgb } from './branding';
+
+export interface PDFExportBranding {
+  displayName?: string;
+  paletteId?: string;
+  primaryColor?: string;
+}
 
 export function exportProductionSheetPDF(
   calc: CalculationResult | ProductionHistoryEntry,
-  businessName = 'Artisan Bakery Co.',
+  businessOrBranding: string | PDFExportBranding = 'Artisan Bakery Co.',
   decimalPlaces = 2
 ): void {
   const doc = new jsPDF({
@@ -13,6 +20,13 @@ export function exportProductionSheetPDF(
     format: 'a4',
   });
 
+  const branding: PDFExportBranding =
+    typeof businessOrBranding === 'string'
+      ? { displayName: businessOrBranding }
+      : businessOrBranding;
+
+  const businessName = branding.displayName || 'Artisan Bakery Co.';
+
   const recipeName = 'recipe' in calc ? calc.recipe.name : calc.recipeName;
   const dateStr = 'calculatedAt' in calc && calc.calculatedAt
     ? new Date(calc.calculatedAt).toLocaleString()
@@ -20,8 +34,15 @@ export function exportProductionSheetPDF(
 
   let y = 15;
 
-  // Header Banner
-  doc.setFillColor(180, 83, 9); // Amber 700 tone
+  // Header Banner tinted with workspace branding palette
+  let bannerRgb = { r: 107, g: 68, b: 35 }; // Default Warm Bakery primary
+  if (branding.primaryColor) {
+    bannerRgb = hexToRgb(branding.primaryColor);
+  } else if (branding.paletteId) {
+    const pal = getPaletteById(branding.paletteId);
+    bannerRgb = hexToRgb(pal.light.primary);
+  }
+  doc.setFillColor(bannerRgb.r, bannerRgb.g, bannerRgb.b);
   doc.rect(0, 0, 210, 24, 'F');
 
   doc.setTextColor(255, 255, 255);
@@ -49,8 +70,9 @@ export function exportProductionSheetPDF(
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(9.5);
   doc.text(`Total Finished Pieces: ${calc.totalPieces.toLocaleString()} items`, 18, y + 16);
+  const totalDecimals = calc.displayWeightUnit === 'g' ? 0 : decimalPlaces;
   doc.text(
-    `Total Batch Weight: ${formatNumber(calc.displayBatchWeight, decimalPlaces)} ${calc.displayWeightUnit.toUpperCase()}`,
+    `Total Batch Weight: ${formatNumber(calc.displayBatchWeight, totalDecimals)} ${calc.displayWeightUnit.toUpperCase()}`,
     18,
     y + 23
   );
@@ -166,16 +188,29 @@ export function exportProductionSheetPDF(
     doc.setFont('helvetica', 'bold');
     doc.text(ing.name, 30, y + 5.5);
 
+    const isPB = ing.isPeanutButter || isPeanutButterIngredient(ing.name, recipeName);
+    const isButter = !isPB && isButterIngredient(ing.name);
+    const { maxDecimals, minDecimals } = getDisplayDecimals(
+      ing.requiredUnit,
+      isButter,
+      decimalPlaces,
+      isPB
+    );
+    const baseUnitIsGrams = ing.baseUnit.trim().toLowerCase() === 'g';
+
     doc.setFont('helvetica', 'normal');
-    doc.text(`${formatNumber(ing.baseQuantity, decimalPlaces)} ${ing.baseUnit}`, 85, y + 5.5);
+    doc.text(`${formatNumber(ing.baseQuantity, baseUnitIsGrams ? 0 : decimalPlaces)} ${ing.baseUnit}`, 85, y + 5.5);
     doc.text(`${ing.wastePercent}%`, 115, y + 5.5);
-    doc.text(`${formatNumber(ing.requiredQuantity, decimalPlaces)} ${ing.requiredUnit}`, 140, y + 5.5);
+    
+    const reqText = `${formatNumber(ing.requiredQuantity, maxDecimals, minDecimals)} ${ing.requiredUnit}`;
+    doc.text(reqText, 140, y + 5.5);
 
     if (calc.suggestedBatches > 1 && ing.perBatchQuantity) {
-      doc.text(`${formatNumber(ing.perBatchQuantity, decimalPlaces)} ${ing.requiredUnit}`, 172, y + 5.5);
+      doc.text(`${formatNumber(ing.perBatchQuantity, maxDecimals, minDecimals)} ${ing.requiredUnit}`, 172, y + 5.5);
     } else if (ing.convertedQuantityInDefaultUnit && ing.defaultUnit) {
+      const defaultUnitIsGrams = ing.defaultUnit.trim().toLowerCase() === 'g';
       doc.text(
-        `${formatNumber(ing.convertedQuantityInDefaultUnit, decimalPlaces)} ${ing.defaultUnit.toUpperCase()}`,
+        `${formatNumber(ing.convertedQuantityInDefaultUnit, defaultUnitIsGrams ? 0 : decimalPlaces)} ${ing.defaultUnit.toUpperCase()}`,
         172,
         y + 5.5
       );
@@ -183,11 +218,14 @@ export function exportProductionSheetPDF(
       doc.text('-', 172, y + 5.5);
     }
 
-    if (ing.notes) {
-      y += 5;
+    if (ing.jarsDetail?.text || ing.notes) {
+      y += 4.5;
       doc.setFontSize(7.5);
       doc.setTextColor(120, 110, 100);
-      doc.text(`Note: ${ing.notes}`, 30, y + 3.5);
+      const subTexts: string[] = [];
+      if (ing.jarsDetail?.text) subTexts.push(`Jars Breakdown: ${ing.jarsDetail.text}`);
+      if (ing.notes) subTexts.push(`Note: ${ing.notes}`);
+      doc.text(subTexts.join('  |  '), 30, y + 3.5);
       doc.setFontSize(8.5);
       doc.setTextColor(30, 30, 30);
     }

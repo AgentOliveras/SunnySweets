@@ -7,6 +7,18 @@ export const INITIAL_SETTINGS: UserSettings = {
   decimalPlaces: 2,
   theme: 'light',
   businessName: 'Artisan Bakery Co.',
+  categoryPresetMap: {
+    Cookies: 'Cookies',
+    Bread: 'Base Dough',
+    Pies: 'Pie Dough',
+    'Pie Dough': 'Pie Dough',
+    Shortbread: 'Shortbread',
+    Pastries: 'Pie Dough',
+    Biscuits: 'Cookies',
+    Scones: 'Cookies',
+    Cakes: 'All',
+    Muffins: 'All',
+  },
 };
 
 export const SAMPLE_MASTER_INGREDIENTS: MasterIngredient[] = [
@@ -25,16 +37,43 @@ export const SAMPLE_MASTER_INGREDIENTS: MasterIngredient[] = [
   { id: 'mi-13', userId: 'default', name: 'Fine Sea Salt', category: 'Salt & Spices', subIngredients: 'Sea Salt, Yellow Prussiate of Soda', brand: 'Morton', supplier: 'Sysco', netWeight: 25, netWeightUnit: 'lb', packageType: 'Bag', allergens: '' },
   { id: 'mi-14', userId: 'default', name: 'Pure Vanilla Extract', category: 'Flavorings', subIngredients: 'Vanilla Bean Extractives in Water, Alcohol (35%)', brand: 'Nielsen-Massey', supplier: 'BakeMark', netWeight: 1, netWeightUnit: 'l', packageType: 'Bottle', allergens: '' },
   { id: 'mi-15', userId: 'default', name: 'Semisweet Chocolate Chips 60%', category: 'Chocolate', subIngredients: 'Sugar, Chocolate Liquor, Cocoa Butter, Milkfat, Soy Lecithin, Natural Vanilla Extract', brand: 'Callebaut', supplier: 'BakeMark', netWeight: 30, netWeightUnit: 'lb', packageType: 'Case', allergens: 'Dairy, Milk, Soy' },
+  { id: 'mi-16', userId: 'default', name: 'Creamy Peanut Butter', category: 'Nut Butters', subIngredients: 'Roasted Peanuts, Sugar, Hydrogenated Vegetable Oil, Salt', brand: 'Jif / Sysco', supplier: 'Sysco', netWeight: 4, netWeightUnit: 'lb', packageType: 'Jar', allergens: 'Peanuts' },
 ];
 
 export const SAMPLE_RECIPES: Recipe[] = [
+  {
+    id: 'sample-recipe-peanut-butter-cookies',
+    userId: 'default',
+    name: 'Bakery Peanut Butter Cookies',
+    description: 'Classic bakery-style soft & chewy peanut butter cookies with crosshatch fork marks.',
+    category: 'Cookies',
+    orderIndex: 0,
+    batchYieldQuantity: 80,
+    batchYieldUnit: 'cookies',
+    defaultWastePercent: 0,
+    archived: false,
+    ingredients: [
+      { id: 'pb1', name: 'All-Purpose Flour', quantity: 2400, unit: 'g', notes: 'King Arthur AP' },
+      { id: 'pb2', name: 'Creamy Peanut Butter', quantity: 1928, unit: 'g', notes: '4 lb commercial jars' },
+      { id: 'pb3', name: 'Unsalted Butter', quantity: 1200, unit: 'g', notes: 'Room temp butter' },
+      { id: 'pb4', name: 'Light Brown Sugar', quantity: 1600, unit: 'g' },
+      { id: 'pb5', name: 'Granulated Sugar', quantity: 1400, unit: 'g' },
+      { id: 'pb6', name: 'Large Eggs', quantity: 16, unit: 'eggs' },
+      { id: 'pb7', name: 'Baking Soda', quantity: 36, unit: 'g' },
+      { id: 'pb8', name: 'Baking Powder', quantity: 24, unit: 'g' },
+      { id: 'pb9', name: 'Fine Sea Salt', quantity: 30, unit: 'g' },
+      { id: 'pb10', name: 'Pure Vanilla Extract', quantity: 60, unit: 'ml', densityGramsPerMl: 1 },
+    ],
+    createdAt: new Date(Date.now() - 8 * 86400000).toISOString(),
+    updatedAt: new Date(Date.now() - 8 * 86400000).toISOString(),
+  },
   {
     id: 'sample-recipe-chocolate-chip',
     userId: 'default',
     name: 'Classic Chocolate Chip Cookies',
     description: 'Rich, chewy bakery cookies with chocolate chips and brown sugar balance.',
     category: 'Cookies',
-    orderIndex: 0,
+    orderIndex: 1,
     batchYieldQuantity: 100,
     batchYieldUnit: 'cookies',
     defaultWastePercent: 2,

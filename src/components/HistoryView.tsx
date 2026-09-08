@@ -13,8 +13,9 @@ import {
   X,
 } from 'lucide-react';
 import { ProductionHistoryEntry } from '../types';
-import { formatNumber } from '../utils/units';
+import { formatNumber, isButterIngredient, isPeanutButterIngredient, getDisplayDecimals } from '../utils/units';
 import { exportProductionSheetPDF } from '../utils/pdfExport';
+import { store } from '../services/store';
 
 interface HistoryViewProps {
   history: ProductionHistoryEntry[];
@@ -131,7 +132,17 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
               <div className="flex items-center gap-1">
                 <button
                   id={`history-export-btn-${entry.id}`}
-                  onClick={() => exportProductionSheetPDF(entry, businessName, decimals)}
+                  onClick={() => {
+                    const branding = store.getWorkspaceBranding();
+                    exportProductionSheetPDF(
+                      entry,
+                      {
+                        displayName: branding.displayName || businessName,
+                        paletteId: branding.paletteId,
+                      },
+                      decimals
+                    );
+                  }}
                   title="Export PDF"
                   className="p-1.5 text-[#8B7E74] hover:text-[#5A534B] hover:bg-[#F5F2ED] dark:hover:bg-[#25221F] rounded-lg transition cursor-pointer"
                 >
@@ -227,19 +238,49 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                         <th className="p-3 text-right">Required Qty</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-[#EEECE8] dark:divide-[#332F2B] text-[#5A534B] dark:text-[#D4CEC7]">
-                      {viewingEntry.calculatedIngredients.map((ing) => (
-                        <tr key={ing.id}>
-                          <td className="p-3 font-semibold">{ing.name}</td>
-                          <td className="p-3 text-right font-mono">
-                            {formatNumber(ing.baseQuantity, decimals)} {ing.baseUnit}
-                          </td>
-                          <td className="p-3 text-right text-[#8B7E74] font-mono">{ing.wastePercent}%</td>
-                          <td className="p-3 text-right font-bold text-[#D4A373] font-mono">
-                            {formatNumber(ing.requiredQuantity, decimals)} {ing.requiredUnit}
-                          </td>
-                        </tr>
-                      ))}
+                    <tbody className="divide-y divide-[#EEECE8] dark:divide-[#332F2B] text-[#5A534B] dark:text-[#F3EFEA]">
+                      {viewingEntry.calculatedIngredients.map((ing) => {
+                        const isPB = ing.isPeanutButter || isPeanutButterIngredient(ing.name, viewingEntry.recipeName);
+                        const isButter = !isPB && isButterIngredient(ing.name);
+                        const { maxDecimals, minDecimals } = getDisplayDecimals(
+                          ing.requiredUnit,
+                          isButter,
+                          decimals,
+                          isPB
+                        );
+                        const baseUnitIsGrams = ing.baseUnit.trim().toLowerCase() === 'g';
+                        return (
+                          <tr key={ing.id}>
+                            <td className="p-3">
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <span className="font-bold text-sm sm:text-base text-[#5A534B] dark:text-[#F3EFEA]">{ing.name}</span>
+                                {isButter && (
+                                  <span className="text-[9px] font-bold px-1.5 py-0.5 rounded-full bg-[#FAF7F2] dark:bg-[#25221F] text-[#5A534B] dark:text-[#EAE6E1] border border-[#D4A373]/50">
+                                    🧈 lbs (2 decimals)
+                                  </span>
+                                )}
+                                {isPB && (
+                                  <span className="text-[9px] font-bold px-1.5 py-0.5 rounded-full bg-[#FAF7F2] dark:bg-[#25221F] text-[#5A534B] dark:text-[#EAE6E1] border border-[#D4A373]/50">
+                                    🥜 4 lb Jars
+                                  </span>
+                                )}
+                              </div>
+                            </td>
+                            <td className="p-3 text-right font-mono text-xs sm:text-sm text-[#8B7E74] dark:text-[#A39E93]">
+                              {formatNumber(ing.baseQuantity, baseUnitIsGrams ? 0 : decimals)} {ing.baseUnit}
+                            </td>
+                            <td className="p-3 text-right text-[#8B7E74] dark:text-[#A39E93] font-mono text-xs sm:text-sm">{ing.wastePercent}%</td>
+                            <td className="p-3 text-right font-bold text-base sm:text-lg text-[#5A534B] dark:text-[#F3EFEA] font-mono">
+                              <div>{formatNumber(ing.requiredQuantity, maxDecimals, minDecimals)} {ing.requiredUnit}</div>
+                              {ing.jarsDetail?.text && (
+                                <div className="text-[11px] font-normal text-[#8B7E74] dark:text-[#D4A373] mt-0.5 font-mono">
+                                  ({ing.jarsDetail.text})
+                                </div>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -248,7 +289,17 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
 
             <div className="p-4 border-t border-[#EEECE8] dark:border-[#332F2B] flex items-center justify-between bg-[#F9F8F6] dark:bg-[#25221F]">
               <button
-                onClick={() => exportProductionSheetPDF(viewingEntry, businessName, decimals)}
+                onClick={() => {
+                  const branding = store.getWorkspaceBranding();
+                  exportProductionSheetPDF(
+                    viewingEntry,
+                    {
+                      displayName: branding.displayName || businessName,
+                      paletteId: branding.paletteId,
+                    },
+                    decimals
+                  );
+                }}
                 className="inline-flex items-center gap-1.5 bg-[#5A534B] hover:bg-[#47413A] dark:bg-[#3D3732] text-white font-bold px-4 py-2 rounded-xl text-xs transition cursor-pointer"
               >
                 <FileText className="w-3.5 h-3.5" />

@@ -1,5 +1,49 @@
 @import "tailwindcss";
 
+:root {
+  --color-primary: #6B4423;
+  --color-accent: #D6A15D;
+  --color-background: #FAF7F2;
+  --color-surface: #FFFFFF;
+  --color-text: #33261D;
+  --color-muted: #8B7E74;
+  --color-border: #E5E1DA;
+  --color-contrast-text: #FFFFFF;
+  --color-danger: #DC2626;
+  --color-success: #16A34A;
+}
+
+.dark {
+  --color-primary: #D6A15D;
+  --color-accent: #E5B880;
+  --color-background: #141210;
+  --color-surface: #1E1B18;
+  --color-text: #FAF7F2;
+  --color-muted: #A39E93;
+  --color-border: #2E2925;
+  --color-contrast-text: #1E1B18;
+}
+
+/* Semantic Workspace Brand Utilities */
+.bg-brand-primary { background-color: var(--color-primary); }
+.text-brand-primary { color: var(--color-primary); }
+.border-brand-primary { border-color: var(--color-primary); }
+
+.bg-brand-accent { background-color: var(--color-accent); }
+.text-brand-accent { color: var(--color-accent); }
+.border-brand-accent { border-color: var(--color-accent); }
+
+.bg-brand-bg { background-color: var(--color-background); }
+.text-brand-bg { color: var(--color-background); }
+
+.bg-brand-surface { background-color: var(--color-surface); }
+.text-brand-surface { color: var(--color-surface); }
+.border-brand-surface { border-color: var(--color-surface); }
+
+.text-brand-text { color: var(--color-text); }
+.text-brand-muted { color: var(--color-muted); }
+.border-brand-border { border-color: var(--color-border); }
+
 @layer base {
   body {
     font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;

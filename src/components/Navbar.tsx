@@ -36,11 +36,24 @@ interface NavbarProps {
 export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab, onOpenAccessModal }) => {
   const [user, setUser] = useState<User | null>(auth.currentUser);
   const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [branding, setBranding] = useState(() => store.getWorkspaceBranding());
+  const [activeWs, setActiveWs] = useState(() => store.getActiveWorkspace());
+  const [imgError, setImgError] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (u) => setUser(u));
     return () => unsubscribe();
+  }, []);
+
+  // Subscribe to store updates for reactive branding and active workspace
+  useEffect(() => {
+    const unsubStore = store.subscribe(() => {
+      setBranding(store.getWorkspaceBranding());
+      setActiveWs(store.getActiveWorkspace());
+      setImgError(false);
+    });
+    return () => unsubStore();
   }, []);
 
   // Close dropdown on click outside or escape key
@@ -97,21 +110,50 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab, onOpenA
         <div
           className="flex items-center gap-3 cursor-pointer group select-none shrink-0"
           onClick={() => handleSelectTab('dashboard')}
+          id="navbar-brand-container"
         >
-          <div className="w-8 h-8 bg-[#D4A373] rounded-lg flex items-center justify-center text-white font-bold shadow-sm group-hover:bg-[#C49363] transition">
-            <ChefHat className="w-5 h-5" />
-          </div>
+          {branding.logoUrl && !imgError ? (
+            <div className="w-8 h-8 rounded-lg overflow-hidden flex items-center justify-center bg-white shadow-xs border border-[var(--color-border)] shrink-0">
+              <img
+                src={branding.logoUrl}
+                alt={branding.displayName}
+                className="w-full h-full object-contain p-0.5"
+                referrerPolicy="no-referrer"
+                onError={() => setImgError(true)}
+              />
+            </div>
+          ) : (
+            <div
+              className="w-8 h-8 rounded-lg flex items-center justify-center font-bold shadow-xs transition shrink-0"
+              style={{
+                backgroundColor: 'var(--color-primary)',
+                color: 'var(--color-contrast-text)',
+              }}
+            >
+              {branding.displayName ? (
+                <span className="text-xs font-bold uppercase tracking-wider">
+                  {branding.displayName.slice(0, 2)}
+                </span>
+              ) : (
+                <ChefHat className="w-5 h-5" />
+              )}
+            </div>
+          )}
           <div className="flex items-center">
-            <h1 className="text-base sm:text-lg md:text-xl font-bold tracking-tight text-[#5A534B] dark:text-[#EAE6E1]">
-              Recipe Calculator
+            <h1 className="text-base sm:text-lg md:text-xl font-bold tracking-tight text-[var(--color-text)]">
+              {branding.displayName || 'Recipe Calculator'}
             </h1>
-            <span className="text-[#A39E93] font-normal mx-2 hidden sm:inline">|</span>
-            <span className="text-xs sm:text-sm text-[#8B7E74] dark:text-[#A39E93] hidden md:inline">
-              Main Street Bakery
-            </span>
+            {activeWs?.name && (
+              <>
+                <span className="text-[var(--color-muted)] font-normal mx-2 hidden sm:inline">|</span>
+                <span className="text-xs sm:text-sm text-[var(--color-muted)] hidden md:inline max-w-[160px] truncate">
+                  {activeWs.name}
+                </span>
+              </>
+            )}
             {store.getUserRole() && (
-              <span className="ml-2 hidden sm:inline-flex items-center gap-1 text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded-full bg-[#FAF3E0] dark:bg-[#2C2416] text-[#7A5B10] dark:text-[#EED285] border border-[#E6C875]/70 dark:border-[#8A6D24]/70">
-                <ShieldCheck className="w-3 h-3 text-[#D4A373]" />
+              <span className="ml-2 hidden sm:inline-flex items-center gap-1 text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded-full bg-[var(--color-background)] text-[var(--color-primary)] border border-[var(--color-border)]">
+                <ShieldCheck className="w-3 h-3 text-[var(--color-accent)]" />
                 <span>{store.getUserRole()}</span>
               </span>
             )}
@@ -130,9 +172,17 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab, onOpenA
                   key={tab.id}
                   id={`nav-desktop-${tab.id}`}
                   onClick={() => setActiveTab(tab.id)}
+                  style={
+                    isActive
+                      ? {
+                          backgroundColor: 'var(--color-primary)',
+                          color: 'var(--color-contrast-text)',
+                        }
+                      : undefined
+                  }
                   className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold tracking-wide transition-all duration-150 cursor-pointer ${
                     isActive
-                      ? 'bg-[#D4A373] text-white shadow-sm'
+                      ? 'shadow-sm'
                       : 'text-[#8B7E74] dark:text-[#A39E93] hover:text-[#5A534B] dark:hover:text-[#EAE6E1] hover:bg-[#E5E1DA]/40 dark:hover:bg-[#332F2B]/50'
                   }`}
                 >
@@ -312,7 +362,11 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, setActiveTab, onOpenA
           {/* Auth / Cloud Sync Status Button */}
           {user ? (
             <button
-              onClick={() => logoutUser()}
+              id="navbar-logout-btn"
+              onClick={async () => {
+                store.clearSession();
+                await logoutUser();
+              }}
               title={`Signed in as ${user.email || 'User'}. Click to sign out.`}
               className="flex items-center gap-1.5 px-2.5 py-2 sm:py-1.5 rounded-xl text-xs font-semibold bg-[#F5F2ED] dark:bg-[#25221F] border border-[#EEECE8] dark:border-[#332F2B] text-[#8B7E74] hover:text-[#5A534B] dark:text-[#A39E93] transition cursor-pointer shrink-0"
             >

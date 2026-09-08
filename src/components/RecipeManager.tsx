@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   Plus,
   Search,
@@ -102,12 +102,14 @@ export const RecipeManager: React.FC<RecipeManagerProps> = ({
   const [customCategoryText, setCustomCategoryText] = useState('');
 
   // Extract all existing unique categories
-  const existingCategories = Array.from(
-    new Set([
-      ...DEFAULT_CATEGORIES,
-      ...recipes.map((r) => r.category).filter(Boolean) as string[],
-    ])
-  ).sort();
+  const existingCategories = useMemo(() => {
+    const set = new Set<string>([
+      ...(settings?.recipeCategories || []),
+      ...(recipes.map((r) => r.category?.trim()).filter(Boolean) as string[]),
+    ]);
+    const arr = Array.from(set).sort();
+    return arr.length > 0 ? arr : ['Cookies'];
+  }, [recipes, settings?.recipeCategories]);
 
   const handleCreateNew = () => {
     const sysUnit = settings?.defaultWeightUnit || 'g';

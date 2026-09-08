@@ -19,6 +19,7 @@ import { Recipe, ProductionPreset, Mixer, ProductionHistoryEntry, UserSettings }
 import { TabType } from './Navbar';
 import { formatNumber } from '../utils/units';
 import { calculateRecipeTotal } from '../utils/calculator';
+import { store } from '../services/store';
 
 interface DashboardProps {
   recipes: Recipe[];
@@ -64,7 +65,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
         </div>
         <div className="relative z-10 max-w-2xl">
           <div className="inline-flex items-center gap-2 bg-[#F5F2ED] dark:bg-[#25221F] border border-[#EEECE8] dark:border-[#332F2B] px-3 py-1 rounded-full text-xs font-semibold text-[#8B7E74] dark:text-[#A39E93] mb-3">
-            <span>{settings.businessName || 'Artisan Bakery Co.'}</span>
+            <span>{store.getWorkspaceBranding().displayName || settings.businessName || 'Artisan Bakery Co.'}</span>
             <span>•</span>
             <span className="uppercase tracking-widest text-[#D4A373] font-bold">{settings.defaultWeightUnit} Base System</span>
           </div>

@@ -1,4 +1,4 @@
-import { WeightUnit, VolumeUnit, MeasurementUnit } from '../types';
+import { WeightUnit, VolumeUnit, MeasurementUnit, PeanutButterJarsDetail } from '../types';
 
 export const WEIGHT_TO_GRAMS: Record<WeightUnit, number> = {
   g: 1,
@@ -6,6 +6,8 @@ export const WEIGHT_TO_GRAMS: Record<WeightUnit, number> = {
   oz: 28.349523125,
   lb: 453.59237,
 };
+
+export const GRAMS_PER_PB_JAR = 1816; // 4 lbs commercial jar (4 * 454g = 1816 grams, yielding 1928g -> 1 jar + 112 grams)
 
 export const VOLUME_TO_ML: Record<VolumeUnit, number> = {
   ml: 1,
@@ -47,6 +49,105 @@ export function isWeightUnit(unit: string): unit is WeightUnit {
 
 export function isVolumeUnit(unit: string): unit is VolumeUnit {
   return unit in VOLUME_TO_ML;
+}
+
+/**
+ * Check if ingredient name represents dairy butter (e.g. Butter, Unsalted Butter, Salted Butter, Brown Butter, etc.)
+ * Excludes nut, fruit, and plant butters like Peanut Butter, Almond Butter, Apple Butter, etc.
+ */
+export function isButterIngredient(name?: string): boolean {
+  if (!name) return false;
+  const trimmed = name.trim();
+  if (/(peanut|almond|apple|cookie|sunflower|cashew|cocoa|hazelnut|soy)\s*butter/i.test(trimmed)) {
+    return false;
+  }
+  return /\bbutter\b/i.test(trimmed);
+}
+
+/**
+ * Check if an ingredient represents Peanut Butter (or if making a Peanut Butter cookie recipe).
+ */
+export function isPeanutButterIngredient(ingredientName?: string, recipeName?: string): boolean {
+  if (!ingredientName) return false;
+  const ing = ingredientName.trim();
+  // Direct peanut butter check
+  if (/\bpeanut\s*butter\b|\bcreamy\s*pb\b|\bcrunchy\s*pb\b|\bpeanut\s*spread\b|\bcreamy\s*peanut\s*butter\b|\bcrunchy\s*peanut\s*butter\b/i.test(ing)) {
+    return true;
+  }
+  // Check if recipe is a peanut butter cookie recipe AND the ingredient is peanut butter/peanut paste
+  if (recipeName && /\bpeanut\s*butter\b/i.test(recipeName)) {
+    if (/\bpeanut\s*butter\b|\bpb\b/i.test(ing)) {
+      return true;
+    }
+    if (/\bpeanut\b/i.test(ing) && !/\bchips\b|\bpieces\b|\bbrittle\b|\bcrunch\b|\bhalves\b|\bchopped\b/i.test(ing)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Convert weight in canonical grams into 4-lb jars with breakdown text.
+ * Each jar is 4 lbs = 1814.36948 grams.
+ * For example: 1928 grams -> 1.06 jars (1 jar + 114 g).
+ */
+export function calculatePeanutButterJarsDetail(totalGrams: number): PeanutButterJarsDetail {
+  if (totalGrams <= 0) {
+    return {
+      jars: 0,
+      fullJars: 0,
+      remainingGrams: 0,
+      text: '0 jars',
+    };
+  }
+
+  const rawJars = totalGrams / GRAMS_PER_PB_JAR;
+  const jars = Number(rawJars.toFixed(2));
+  const fullJars = Math.floor(rawJars);
+  const remainingGrams = Math.max(0, Math.round(totalGrams - fullJars * GRAMS_PER_PB_JAR));
+
+  let text = '';
+  if (fullJars > 0 && remainingGrams > 0) {
+    text = `${fullJars} ${fullJars === 1 ? 'jar' : 'jars'} + ${remainingGrams} grams`;
+  } else if (fullJars > 0 && remainingGrams === 0) {
+    text = `${fullJars} ${fullJars === 1 ? 'jar' : 'jars'}`;
+  } else {
+    text = `${remainingGrams} grams`;
+  }
+
+  return {
+    jars,
+    fullJars,
+    remainingGrams,
+    text,
+  };
+}
+
+/**
+ * Helper to determine decimal precision for displaying ingredient amounts and totals:
+ * - Butter: always 2 decimal points (in lbs).
+ * - Peanut Butter: always 2 decimal points (in jars).
+ * - Grams ('g'): 0 decimal points (always rounded to whole integers, no decimals).
+ * - Other units: uses user settings or fallback decimals.
+ */
+export function getDisplayDecimals(
+  unit?: string,
+  isButter = false,
+  customDecimals?: number,
+  isPeanutButter = false
+): { maxDecimals: number; minDecimals: number } {
+  if (isButter || isPeanutButter) {
+    return { maxDecimals: 2, minDecimals: 2 };
+  }
+  const normalizedUnit = (unit || '').trim().toLowerCase();
+  if (normalizedUnit === 'jars' || normalizedUnit === 'jar') {
+    return { maxDecimals: 2, minDecimals: 2 };
+  }
+  if (normalizedUnit === 'g' || normalizedUnit === 'gram' || normalizedUnit === 'grams') {
+    return { maxDecimals: 0, minDecimals: 0 };
+  }
+  const max = customDecimals !== undefined ? customDecimals : 2;
+  return { maxDecimals: max, minDecimals: 0 };
 }
 
 /**

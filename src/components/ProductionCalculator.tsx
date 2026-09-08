@@ -27,8 +27,17 @@ import {
   ProductionHistoryEntry,
 } from '../types';
 import { calculateProduction, calculateRecipeTotal } from '../utils/calculator';
-import { formatNumber, WEIGHT_UNITS, convertWeight, getUnitLabel } from '../utils/units';
+import {
+  formatNumber,
+  WEIGHT_UNITS,
+  convertWeight,
+  getUnitLabel,
+  isButterIngredient,
+  isPeanutButterIngredient,
+  getDisplayDecimals,
+} from '../utils/units';
 import { exportProductionSheetPDF } from '../utils/pdfExport';
+import { store } from '../services/store';
 
 interface ProductionCalculatorProps {
   recipes: Recipe[];
@@ -74,8 +83,10 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
     },
   ]);
 
-  // Waste override (temporary calculation waste %)
-  const [wasteOverride, setWasteOverride] = useState<string>('');
+  // Waste override (temporary calculation waste %) - defaults to 6%
+  const [wasteOverride, setWasteOverride] = useState<string>(
+    settings.defaultWastePercent !== undefined ? String(settings.defaultWastePercent) : '6'
+  );
 
   // Selected Mixer
   const [selectedMixerId, setSelectedMixerId] = useState<string>(
@@ -86,7 +97,18 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
   // Display Unit Toggle
   const [displayUnit, setDisplayUnit] = useState<WeightUnit>(settings.defaultWeightUnit || 'lb');
 
-  // Group presets by category for organized selection
+  // Active preset routing categories for the currently selected recipe
+  const mappedPresetCategories = React.useMemo<string[]>(() => {
+    if (!selectedRecipe || !selectedRecipe.category) return ['All'];
+    const mapVal = settings.categoryPresetMap && settings.categoryPresetMap[selectedRecipe.category];
+    if (!mapVal) return ['All'];
+    if (Array.isArray(mapVal)) {
+      return mapVal.length === 0 ? ['All'] : mapVal;
+    }
+    return [mapVal];
+  }, [selectedRecipe, settings.categoryPresetMap]);
+
+  // Group presets by category for organized selection, prioritizing mapped categories
   const groupedPresets = React.useMemo(() => {
     const groups: Record<string, ProductionPreset[]> = {};
     presets.forEach((p) => {
@@ -94,8 +116,51 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
       if (!groups[cat]) groups[cat] = [];
       groups[cat].push(p);
     });
-    return groups;
-  }, [presets]);
+
+    const isAll = mappedPresetCategories.includes('All');
+    if (isAll) return groups;
+
+    // Place all mapped categories at the front of categories
+    const sortedGroups: Record<string, ProductionPreset[]> = {};
+    mappedPresetCategories.forEach((cat) => {
+      if (groups[cat]) {
+        sortedGroups[cat] = groups[cat];
+      }
+    });
+    Object.keys(groups).forEach((key) => {
+      if (!sortedGroups[key]) {
+        sortedGroups[key] = groups[key];
+      }
+    });
+    return sortedGroups;
+  }, [presets, mappedPresetCategories]);
+
+  // Update requirement preset when recipe changes if default empty
+  useEffect(() => {
+    if (requirements.length === 1 && (!requirements[0].quantity || requirements[0].quantity === ('' as any))) {
+      let targetPreset = presets[0] || null;
+      const isAll = mappedPresetCategories.includes('All');
+      if (!isAll && mappedPresetCategories.length > 0) {
+        const found = presets.find((p) =>
+          mappedPresetCategories.some((mc) => mc.toLowerCase() === (p.category || 'Cookies').toLowerCase())
+        );
+        if (found) targetPreset = found;
+      }
+      if (targetPreset) {
+        setRequirements([
+          {
+            id: `req-1`,
+            presetId: targetPreset.id,
+            presetName: targetPreset.name,
+            quantity: '' as any,
+            piecesPerUnit: targetPreset.quantityPerUnit,
+            itemWeight: targetPreset.finishedWeight,
+            itemWeightUnit: targetPreset.weightUnit,
+          },
+        ]);
+      }
+    }
+  }, [selectedRecipeId, mappedPresetCategories]);
 
   // Capacity Warning Override State
   const [capacityOverridden, setCapacityOverridden] = useState(false);
@@ -107,12 +172,18 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
   // Calculation Result
   const [calculationResult, setCalculationResult] = useState<CalculationResult | null>(null);
 
-  // Synchronize display unit when business settings change
+  // Synchronize display unit and default waste when business settings change
   useEffect(() => {
     if (settings.defaultWeightUnit) {
       setDisplayUnit(settings.defaultWeightUnit);
     }
   }, [settings.defaultWeightUnit]);
+
+  useEffect(() => {
+    if (settings.defaultWastePercent !== undefined) {
+      setWasteOverride(String(settings.defaultWastePercent));
+    }
+  }, [settings.defaultWastePercent]);
 
   // Perform Calculation function
   const handleCalculate = (
@@ -200,7 +271,14 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
 
   // Add requirement item
   const handleAddRequirement = () => {
-    const firstPreset = presets.length > 0 ? presets[0] : null;
+    let firstPreset = presets.length > 0 ? presets[0] : null;
+    const isAll = mappedPresetCategories.includes('All');
+    if (!isAll && mappedPresetCategories.length > 0) {
+      const found = presets.find((p) =>
+        mappedPresetCategories.some((mc) => mc.toLowerCase() === (p.category || 'Cookies').toLowerCase())
+      );
+      if (found) firstPreset = found;
+    }
     const newReq: ProductionItemRequirement = {
       id: `req-${Date.now()}`,
       presetId: firstPreset ? firstPreset.id : undefined,
@@ -341,13 +419,25 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
 
           {/* Step 2: Production Requirements (Presets or Custom) */}
           <div className="bg-white dark:bg-[#1E1B18] border border-[#E5E1DA] dark:border-[#2D2925] rounded-xl p-5 shadow-sm space-y-4">
-            <div className="flex items-center justify-between">
-              <h3 className="font-bold text-sm text-[#5A534B] dark:text-[#EAE6E1] flex items-center gap-2">
-                <span className="w-5 h-5 rounded bg-[#D4A373] text-white flex items-center justify-center text-xs font-bold">
-                  2
-                </span>
-                <span>Production Requirements</span>
-              </h3>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h3 className="font-bold text-sm text-[#5A534B] dark:text-[#EAE6E1] flex items-center gap-2">
+                  <span className="w-5 h-5 rounded bg-[#D4A373] text-white flex items-center justify-center text-xs font-bold">
+                    2
+                  </span>
+                  <span>Production Requirements</span>
+                </h3>
+                {selectedRecipe && mappedPresetCategories && (
+                  <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-[#FAF7F2] dark:bg-[#25221F] border border-[#EEECE8] dark:border-[#332F2B] text-[#8B7E74] dark:text-[#A39E93]">
+                    Preset Routing:{' '}
+                    <span className="text-[#D4A373] font-bold">
+                      {mappedPresetCategories.includes('All')
+                        ? '✨ All Presets'
+                        : `${mappedPresetCategories.join(', ')} Presets`}
+                    </span>
+                  </span>
+                )}
+              </div>
 
               <button
                 id="calc-add-req-btn"
@@ -610,7 +700,17 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
 
                   <button
                     id="calc-export-pdf-btn"
-                    onClick={() => exportProductionSheetPDF(calculationResult, settings.businessName, decimals)}
+                    onClick={() => {
+                      const branding = store.getWorkspaceBranding();
+                      exportProductionSheetPDF(
+                        calculationResult,
+                        {
+                          displayName: branding.displayName || settings.businessName,
+                          paletteId: branding.paletteId,
+                        },
+                        decimals
+                      );
+                    }}
                     className="inline-flex items-center gap-1.5 bg-[#5A534B] hover:bg-[#47413A] dark:bg-[#3D3732] text-white font-bold px-3 py-2 rounded-xl text-xs transition cursor-pointer"
                   >
                     <FileText className="w-3.5 h-3.5" />
@@ -636,7 +736,7 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
                     <span>Capacity Warning</span>
                   </div>
                   <p className="text-xs text-[#8B7E74] dark:text-[#A39E93] leading-relaxed">
-                    Calculated batch weight (<strong>{formatNumber(calculationResult.displayBatchWeight, decimals)} {calculationResult.displayWeightUnit.toUpperCase()}</strong>) exceeds {calculationResult.mixer?.name || 'Mixer'} capacity (<strong>{calculationResult.mixer?.maxWeight} {calculationResult.mixer?.weightUnit.toUpperCase()}</strong>).
+                    Calculated batch weight (<strong>{formatNumber(calculationResult.displayBatchWeight, calculationResult.displayWeightUnit === 'g' ? 0 : decimals)} {calculationResult.displayWeightUnit.toUpperCase()}</strong>) exceeds {calculationResult.mixer?.name || 'Mixer'} capacity (<strong>{calculationResult.mixer?.maxWeight} {calculationResult.mixer?.weightUnit.toUpperCase()}</strong>).
                   </p>
                   <div className="bg-white/90 dark:bg-[#1E1B18]/90 p-2.5 rounded-lg text-xs border border-[#F5D5CF] dark:border-[#4E2620] font-bold text-[#A65B48] dark:text-[#EAA89A]">
                     💡 Suggested Split: Mix into <strong>{calculationResult.suggestedBatches} batches</strong>.
@@ -660,7 +760,7 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
                     Total Batch Weight
                   </span>
                   <div className="text-xl font-bold font-mono text-[#5A534B] dark:text-[#EAE6E1]">
-                    {formatNumber(calculationResult.displayBatchWeight, decimals)}{' '}
+                    {formatNumber(calculationResult.displayBatchWeight, calculationResult.displayWeightUnit === 'g' ? 0 : decimals)}{' '}
                     <span className="text-xs font-normal text-[#8B7E74]">
                       {calculationResult.displayWeightUnit.toUpperCase()}
                     </span>
@@ -716,15 +816,15 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
                 </div>
 
                 <div className="overflow-x-auto rounded-xl border border-[#E5E1DA] dark:border-[#2D2925]">
-                  <table className="w-full text-left text-xs">
-                    <thead className="bg-[#F5F2ED] dark:bg-[#25221F] text-[#5A534B] dark:text-[#EAE6E1] font-bold uppercase text-[10px] tracking-widest">
+                  <table className="w-full text-left">
+                    <thead className="bg-[#F5F2ED] dark:bg-[#25221F] text-[#5A534B] dark:text-[#EAE6E1] font-bold uppercase text-xs tracking-wider">
                       <tr>
-                        <th className="p-3 w-12 text-center">Done</th>
-                        <th className="p-3">Ingredient</th>
-                        <th className="p-3 text-right">Required Qty</th>
+                        <th className="p-3.5 w-14 text-center">Done</th>
+                        <th className="p-3.5">Ingredient</th>
+                        <th className="p-3.5 text-right">Required Qty</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-[#F0EEEA] dark:divide-[#2D2925] text-[#2D2926] dark:text-[#EAE6E1] font-medium">
+                    <tbody className="divide-y divide-[#F0EEEA] dark:divide-[#2D2925] text-[#5A534B] dark:text-[#F3EFEA] font-medium">
                       {calculationResult.calculatedIngredients.map((ing) => {
                         const isDone = !!checkedIngredients[ing.id];
                         return (
@@ -742,54 +842,103 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
                                 : 'hover:bg-[#F9F8F6] dark:hover:bg-[#25221F]/60'
                             }`}
                           >
-                            <td className="p-3 text-center">
+                            <td className="p-3.5 text-center">
                               <div
-                                className={`w-5 h-5 mx-auto rounded flex items-center justify-center transition-colors border ${
+                                className={`w-6 h-6 mx-auto rounded-md flex items-center justify-center transition-colors border ${
                                   isDone
                                     ? 'bg-[#5A534B] border-[#5A534B] text-white'
-                                    : 'border-[#D4A373] bg-white dark:bg-[#1E1B18] text-transparent hover:border-[#5A534B]'
+                                    : 'border-[#5A534B]/40 dark:border-[#A39E93]/40 bg-white dark:bg-[#1E1B18] text-transparent hover:border-[#5A534B]'
                                 }`}
                               >
-                                {isDone && <Check className="w-3.5 h-3.5 stroke-[3]" />}
+                                {isDone && <Check className="w-4 h-4 stroke-[3]" />}
                               </div>
                             </td>
-                            <td className="p-3 font-semibold text-[#5A534B] dark:text-[#EAE6E1]">
-                              <span className={isDone ? 'line-through text-[#8B7E74] dark:text-[#8B7E74]' : ''}>
-                                {ing.name}
-                              </span>
+                            <td className="p-3.5">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span
+                                  className={`text-base sm:text-lg font-bold ${
+                                    isDone
+                                      ? 'line-through text-[#8B7E74] dark:text-[#8B7E74]'
+                                      : 'text-[#5A534B] dark:text-[#F3EFEA]'
+                                  }`}
+                                >
+                                  {ing.name}
+                                </span>
+                                {isButterIngredient(ing.name) && (
+                                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-[#FAF7F2] dark:bg-[#25221F] text-[#5A534B] dark:text-[#EAE6E1] border border-[#D4A373]/50">
+                                    🧈 lbs (2 decimals)
+                                  </span>
+                                )}
+                                {(ing.isPeanutButter || isPeanutButterIngredient(ing.name, selectedRecipe?.name)) && (
+                                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-[#FAF7F2] dark:bg-[#25221F] text-[#5A534B] dark:text-[#EAE6E1] border border-[#D4A373]/50 flex items-center gap-1">
+                                    <span>🥜</span> 4 lb Jars
+                                  </span>
+                                )}
+                              </div>
                               {ing.notes && (
-                                <div className="text-[10px] font-normal text-[#8B7E74]">{ing.notes}</div>
-                              )}
-                            </td>
-                            <td className="p-3 text-right">
-                              <div
-                                className={`font-bold font-mono text-sm ${
-                                  isDone ? 'line-through text-[#8B7E74]' : 'text-[#D4A373]'
-                                }`}
-                              >
-                                {formatNumber(ing.requiredQuantity, decimals)} {ing.requiredUnit}
-                              </div>
-                              {calculationResult.suggestedBatches > 1 && ing.perBatchQuantity && (
-                                <div className="text-[10px] font-mono text-[#C97B63] font-semibold mt-0.5">
-                                  ({formatNumber(ing.perBatchQuantity, decimals)} {ing.requiredUnit} / batch)
+                                <div className="text-xs font-normal text-[#8B7E74] dark:text-[#A39E93] mt-0.5">
+                                  {ing.notes}
                                 </div>
                               )}
+                            </td>
+                            <td className="p-3.5 text-right">
+                              {(() => {
+                                const isPB = ing.isPeanutButter || isPeanutButterIngredient(ing.name, selectedRecipe?.name);
+                                const isButter = !isPB && isButterIngredient(ing.name);
+                                const { maxDecimals, minDecimals } = getDisplayDecimals(
+                                  ing.requiredUnit,
+                                  isButter,
+                                  decimals,
+                                  isPB
+                                );
+                                return (
+                                  <div className="flex flex-col items-end">
+                                    <div
+                                      className={`font-bold font-mono text-lg sm:text-xl tracking-tight ${
+                                        isDone
+                                          ? 'line-through text-[#8B7E74]'
+                                          : 'text-[#5A534B] dark:text-[#F3EFEA]'
+                                      }`}
+                                    >
+                                      {formatNumber(ing.requiredQuantity, maxDecimals, minDecimals)} {ing.requiredUnit}
+                                    </div>
+                                    {ing.jarsDetail?.text && (
+                                      <div
+                                        className={`inline-flex items-center gap-1 text-xs font-mono font-bold mt-0.5 px-2 py-0.5 rounded bg-[#F5F2ED] dark:bg-[#25221F] border border-[#E5E1DA] dark:border-[#3A3530] ${
+                                          isDone ? 'text-[#8B7E74]' : 'text-[#8B7E74] dark:text-[#D4A373]'
+                                        }`}
+                                      >
+                                        <span>({ing.jarsDetail.text})</span>
+                                      </div>
+                                    )}
+                                    {calculationResult.suggestedBatches > 1 && ing.perBatchQuantity !== undefined && (
+                                      <div className="text-xs sm:text-sm font-mono text-[#5A534B]/80 dark:text-[#F3EFEA]/80 font-bold mt-0.5">
+                                        ({formatNumber(ing.perBatchQuantity, maxDecimals, minDecimals)} {ing.requiredUnit} / batch
+                                        {ing.perBatchJarsDetail?.text ? ` • ${ing.perBatchJarsDetail.text}` : ''})
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })()}
                             </td>
                           </tr>
                         );
                       })}
                     </tbody>
-                    <tfoot className="bg-[#F5F2ED] dark:bg-[#25221F] border-t-2 border-[#E5E1DA] dark:border-[#332F2B] font-bold text-xs">
+                    <tfoot className="bg-[#F5F2ED] dark:bg-[#25221F] border-t-2 border-[#E5E1DA] dark:border-[#332F2B] font-bold text-sm">
                       <tr>
-                        <td colSpan={2} className="p-3 text-[#5A534B] dark:text-[#EAE6E1]">
-                          <div className="flex items-center gap-1.5">
-                            <Scale className="w-4 h-4 text-[#D4A373]" />
-                            <span>Total Scaled Batch Weight:</span>
+                        <td colSpan={2} className="p-3.5 text-[#5A534B] dark:text-[#EAE6E1]">
+                          <div className="flex items-center gap-2">
+                            <Scale className="w-5 h-5 text-[#5A534B] dark:text-[#D4A373]" />
+                            <span className="text-sm sm:text-base">Total Scaled Batch Weight:</span>
                           </div>
                         </td>
-                        <td className="p-3 text-right">
-                          <span className="font-mono font-bold text-sm text-[#D4A373]">
-                            {formatNumber(calculationResult.displayBatchWeight, decimals)}{' '}
+                        <td className="p-3.5 text-right">
+                          <span className="font-mono font-bold text-base sm:text-lg text-[#5A534B] dark:text-[#F3EFEA]">
+                            {formatNumber(
+                              calculationResult.displayBatchWeight,
+                              calculationResult.displayWeightUnit === 'g' ? 0 : decimals
+                            )}{' '}
                             {calculationResult.displayWeightUnit.toUpperCase()}
                           </span>
                         </td>

@@ -1,0 +1,204 @@
+rules_version = '2';
+
+/**
+ * Sunny Sweets - Phase 0 Temporary Migration Rules
+ *
+ * PURPOSE:
+ * This temporary ruleset provides the minimum narrowly-scoped mechanism
+ * necessary to allow the verified Sunny Sweets owner to bootstrap `ws-main`
+ * and tag unscoped legacy production documents with `workspaceId: "ws-main"`.
+ *
+ * DO NOT DEPLOY TO PRODUCTION PERMANENTLY.
+ * Once migration is verified, deploy `firestore.rules` (Final Production Rules).
+ */
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    function isVerifiedEmail() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    // Narrow migration bootstrap check: verified owner email
+    function isMigrationOwner() {
+      return isVerifiedEmail() && (
+        request.auth.token.email.lower() == 'jaoliveras@gmail.com' ||
+        (exists(/databases/$(database)/documents/workspaces/ws-main) &&
+         get(/databases/$(database)/documents/workspaces/ws-main).data.ownerEmail != null &&
+         request.auth.token.email.lower() == get(/databases/$(database)/documents/workspaces/ws-main).data.ownerEmail.lower())
+      );
+    }
+
+    function isWorkspaceMember(workspaceId) {
+      return isSignedIn() && (
+        exists(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)) ||
+        (exists(/databases/$(database)/documents/workspaces/$(workspaceId)) &&
+         get(/databases/$(database)/documents/workspaces/$(workspaceId)).data.ownerId == request.auth.uid) ||
+        (workspaceId == 'ws-main' && isMigrationOwner())
+      );
+    }
+
+    function getMemberRole(workspaceId) {
+      return exists(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid))
+        ? get(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)).data.role
+        : ((exists(/databases/$(database)/documents/workspaces/$(workspaceId)) &&
+            get(/databases/$(database)/documents/workspaces/$(workspaceId)).data.ownerId == request.auth.uid) ||
+           (workspaceId == 'ws-main' && isMigrationOwner())
+            ? 'owner'
+            : null);
+    }
+
+    function isWorkspaceOwner(workspaceId) {
+      return isSignedIn() && getMemberRole(workspaceId) == 'owner';
+    }
+
+    function isWorkspaceEditor(workspaceId) {
+      return isSignedIn() && (getMemberRole(workspaceId) == 'editor' || getMemberRole(workspaceId) == 'owner');
+    }
+
+    // --- Workspaces & Members Subcollections ---
+    match /workspaces/{workspaceId} {
+      allow read: if isWorkspaceMember(workspaceId);
+      allow create: if isSignedIn() && (request.resource.data.ownerId == request.auth.uid || isMigrationOwner());
+      allow update: if isWorkspaceOwner(workspaceId);
+      allow delete: if isWorkspaceOwner(workspaceId);
+
+      // Members subcollection
+      match /members/{memberId} {
+        allow read: if isWorkspaceMember(workspaceId);
+        // Allows verified owner during migration to create workspaces/ws-main/members/{theirUid}
+        allow create, update, delete: if isWorkspaceOwner(workspaceId) || (
+          workspaceId == 'ws-main' && isMigrationOwner() && memberId == request.auth.uid
+        );
+      }
+    }
+
+    // --- Recipes Collection ---
+    match /recipes/{recipeId} {
+      allow read: if isSignedIn() && (
+        (resource.data.workspaceId != null && isWorkspaceMember(resource.data.workspaceId)) ||
+        (!("workspaceId" in resource.data) && isMigrationOwner())
+      );
+
+      allow create: if isSignedIn() &&
+        request.resource.data.workspaceId != null &&
+        isWorkspaceEditor(request.resource.data.workspaceId);
+
+      allow update: if isSignedIn() && (
+        (resource.data.workspaceId != null &&
+         request.resource.data.workspaceId == resource.data.workspaceId &&
+         isWorkspaceEditor(resource.data.workspaceId)) ||
+        (!("workspaceId" in resource.data) && request.resource.data.workspaceId == 'ws-main' && isMigrationOwner())
+      );
+
+      allow delete: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        isWorkspaceEditor(resource.data.workspaceId);
+    }
+
+    // --- Presets Collection ---
+    match /presets/{presetId} {
+      allow read: if isSignedIn() && (
+        (resource.data.workspaceId != null && isWorkspaceMember(resource.data.workspaceId)) ||
+        (!("workspaceId" in resource.data) && isMigrationOwner())
+      );
+
+      allow create: if isSignedIn() &&
+        request.resource.data.workspaceId != null &&
+        isWorkspaceEditor(request.resource.data.workspaceId);
+
+      allow update: if isSignedIn() && (
+        (resource.data.workspaceId != null &&
+         request.resource.data.workspaceId == resource.data.workspaceId &&
+         isWorkspaceEditor(resource.data.workspaceId)) ||
+        (!("workspaceId" in resource.data) && request.resource.data.workspaceId == 'ws-main' && isMigrationOwner())
+      );
+
+      allow delete: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        isWorkspaceEditor(resource.data.workspaceId);
+    }
+
+    // --- Mixers Collection ---
+    match /mixers/{mixerId} {
+      allow read: if isSignedIn() && (
+        (resource.data.workspaceId != null && isWorkspaceMember(resource.data.workspaceId)) ||
+        (!("workspaceId" in resource.data) && isMigrationOwner())
+      );
+
+      allow create: if isSignedIn() &&
+        request.resource.data.workspaceId != null &&
+        isWorkspaceEditor(request.resource.data.workspaceId);
+
+      allow update: if isSignedIn() && (
+        (resource.data.workspaceId != null &&
+         request.resource.data.workspaceId == resource.data.workspaceId &&
+         isWorkspaceEditor(resource.data.workspaceId)) ||
+        (!("workspaceId" in resource.data) && request.resource.data.workspaceId == 'ws-main' && isMigrationOwner())
+      );
+
+      allow delete: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        isWorkspaceEditor(resource.data.workspaceId);
+    }
+
+    // --- History Collection ---
+    match /history/{historyId} {
+      allow read: if isSignedIn() && (
+        (resource.data.workspaceId != null && isWorkspaceMember(resource.data.workspaceId)) ||
+        (!("workspaceId" in resource.data) && isMigrationOwner())
+      );
+
+      allow create: if isSignedIn() &&
+        request.resource.data.workspaceId != null &&
+        isWorkspaceEditor(request.resource.data.workspaceId);
+
+      allow update: if isSignedIn() && (
+        (resource.data.workspaceId != null &&
+         request.resource.data.workspaceId == resource.data.workspaceId &&
+         isWorkspaceEditor(resource.data.workspaceId)) ||
+        (!("workspaceId" in resource.data) && request.resource.data.workspaceId == 'ws-main' && isMigrationOwner())
+      );
+
+      allow delete: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        isWorkspaceEditor(resource.data.workspaceId);
+    }
+
+    // --- Master Ingredients Collection ---
+    match /master_ingredients/{ingredientId} {
+      allow read: if isSignedIn() && (
+        (resource.data.workspaceId != null && isWorkspaceMember(resource.data.workspaceId)) ||
+        (!("workspaceId" in resource.data) && isMigrationOwner())
+      );
+
+      allow create: if isSignedIn() &&
+        request.resource.data.workspaceId != null &&
+        isWorkspaceEditor(request.resource.data.workspaceId);
+
+      allow update: if isSignedIn() && (
+        (resource.data.workspaceId != null &&
+         request.resource.data.workspaceId == resource.data.workspaceId &&
+         isWorkspaceEditor(resource.data.workspaceId)) ||
+        (!("workspaceId" in resource.data) && request.resource.data.workspaceId == 'ws-main' && isMigrationOwner())
+      );
+
+      allow delete: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        isWorkspaceEditor(resource.data.workspaceId);
+    }
+
+    // --- User Settings (Private to authenticated UID) ---
+    match /settings/{userId} {
+      allow read, write: if isSignedIn() && request.auth.uid == userId;
+    }
+
+    // --- Catch-All Deny ---
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

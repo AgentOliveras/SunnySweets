@@ -12,7 +12,7 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { CalculationResult, CalculatedIngredient } from '../types';
-import { formatNumber } from '../utils/units';
+import { formatNumber, isButterIngredient, isPeanutButterIngredient, getDisplayDecimals } from '../utils/units';
 import { store } from '../services/store';
 
 interface GuidedMixingModeProps {
@@ -226,15 +226,22 @@ export const GuidedMixingMode: React.FC<GuidedMixingModeProps> = ({ calculation,
                   </div>
 
                   <div className="flex-1">
-                    <h3
-                      className={`font-serif font-semibold text-base ${
-                        isDone
-                          ? 'line-through text-[#A39E93] dark:text-[#A39E93]'
-                          : 'text-[#5A534B] dark:text-[#EAE6E1]'
-                      }`}
-                    >
-                      {ing.name}
-                    </h3>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <h3
+                        className={`font-serif font-bold text-lg sm:text-xl ${
+                          isDone
+                            ? 'line-through text-[#A39E93] dark:text-[#A39E93]'
+                            : 'text-[#5A534B] dark:text-[#F3EFEA]'
+                        }`}
+                      >
+                        {ing.name}
+                      </h3>
+                      {(ing.isPeanutButter || isPeanutButterIngredient(ing.name, calculation.recipe?.name)) && (
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-[#FAF7F2] dark:bg-[#25221F] text-[#5A534B] dark:text-[#EAE6E1] border border-[#D4A373]/50">
+                          🥜 4 lb Jars
+                        </span>
+                      )}
+                    </div>
                     {ing.notes && (
                       <p className="text-xs text-[#8B7E74] dark:text-[#A39E93] mt-0.5 font-medium">
                         {ing.notes}
@@ -243,16 +250,44 @@ export const GuidedMixingMode: React.FC<GuidedMixingModeProps> = ({ calculation,
                   </div>
                 </div>
 
-                <div className="text-right shrink-0">
-                  <div
-                    className={`font-mono font-bold text-lg ${
-                      isDone ? 'text-[#A39E93]' : 'text-[#D4A373]'
-                    }`}
-                  >
-                    {formatNumber(batchAmount || 0, decimalPlaces !== undefined ? decimalPlaces : 2)} {ing.requiredUnit}
-                  </div>
+                <div className="text-right shrink-0 flex flex-col items-end">
+                  {(() => {
+                    const isPB = ing.isPeanutButter || isPeanutButterIngredient(ing.name, calculation.recipe?.name);
+                    const isButter = !isPB && isButterIngredient(ing.name);
+                    const { maxDecimals, minDecimals } = getDisplayDecimals(
+                      ing.requiredUnit,
+                      isButter,
+                      decimalPlaces,
+                      isPB
+                    );
+                    const noteText = totalBatches > 1
+                      ? ing.perBatchJarsDetail?.text || ing.jarsDetail?.text
+                      : ing.jarsDetail?.text;
+
+                    return (
+                      <>
+                        <div
+                          className={`font-mono font-bold text-xl sm:text-2xl tracking-tight ${
+                            isDone ? 'line-through text-[#A39E93]' : 'text-[#5A534B] dark:text-[#F3EFEA]'
+                          }`}
+                        >
+                          {formatNumber(batchAmount || 0, maxDecimals, minDecimals)}{' '}
+                          {ing.requiredUnit}
+                        </div>
+                        {noteText && (
+                          <div
+                            className={`text-xs font-mono font-bold px-2 py-0.5 rounded bg-[#F5F2ED] dark:bg-[#25221F] border border-[#E5E1DA] dark:border-[#3A3530] mt-0.5 ${
+                              isDone ? 'text-[#A39E93]' : 'text-[#8B7E74] dark:text-[#D4A373]'
+                            }`}
+                          >
+                            ({noteText})
+                          </div>
+                        )}
+                      </>
+                    );
+                  })()}
                   {ing.wastePercent > 0 && (
-                    <span className="text-[10px] text-[#A39E93]">Includes {ing.wastePercent}% waste</span>
+                    <span className="text-[10px] text-[#A39E93] mt-0.5">Includes {ing.wastePercent}% waste</span>
                   )}
                 </div>
               </div>
