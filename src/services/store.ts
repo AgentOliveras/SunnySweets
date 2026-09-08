@@ -25,6 +25,7 @@ import {
   WeightUnit,
   WorkspaceBranding,
   PresetPaletteId,
+  WorkspaceMemberDoc,
 } from '../types';
 import {
   db,
@@ -101,6 +102,7 @@ export class StoreManager {
   private settings: UserSettings = INITIAL_SETTINGS;
   private masterIngredients: MasterIngredient[] = [];
   private workspaces: Workspace[] = [];
+  private workspaceMembers: WorkspaceMemberDoc[] = [];
   private activeWorkspaceId: string = 'ws-main';
   private currentUserId: string | null = null;
   private validatedUid: string | null = null;
@@ -195,6 +197,7 @@ export class StoreManager {
     this.mixers = [];
     this.history = [];
     this.masterIngredients = [];
+    this.workspaceMembers = [];
 
     // Clear production caches from localStorage on unauthorized or sign-out state
     localStorage.removeItem(STORAGE_KEYS.RECIPES);
@@ -310,6 +313,47 @@ export class StoreManager {
     this.unsubs = [];
 
     const wsId = this.activeWorkspaceId || 'ws-main';
+
+    // 0. Subscribe to Members of active workspace
+    const membersColRef = collection(db, 'workspaces', wsId, 'members');
+    const unsubMembers = onSnapshot(
+      membersColRef,
+      (snapshot) => {
+        const memberList: WorkspaceMemberDoc[] = [];
+        snapshot.forEach((d) => {
+          const data = d.data();
+          memberList.push({
+            uid: data.uid || d.id,
+            id: d.id,
+            email: data.email || '',
+            name: data.name || (data.email ? data.email.split('@')[0] : 'Member'),
+            role: (data.role as AccessRole) || 'viewer',
+            active: data.active !== false,
+            addedAt: data.addedAt || '',
+            updatedAt: data.updatedAt || data.addedAt || '',
+          });
+        });
+        this.workspaceMembers = memberList;
+
+        // Check if current user is still an active member
+        const currentUid = auth.currentUser?.uid;
+        if (currentUid) {
+          const myDoc = memberList.find((m) => m.uid === currentUid);
+          if (!myDoc || myDoc.active === false) {
+            this.validatedUid = null;
+            this.validatedUserRole = null;
+            this.clearProductionRecordsFromMemory();
+          } else if (myDoc.role !== this.validatedUserRole) {
+            this.validatedUserRole = myDoc.role;
+          }
+        }
+        this.notify();
+      },
+      (error) => {
+        this.handleSyncError(error, `workspaces/${wsId}/members`);
+      }
+    );
+    this.unsubs.push(unsubMembers);
 
     // 1. Subscribe to active Workspace
     const wsDocRef = doc(db, 'workspaces', wsId);
@@ -643,7 +687,11 @@ export class StoreManager {
       const memberDoc = await getDoc(doc(db, 'workspaces', wsId, 'members', uid));
       if (memberDoc.exists()) {
         const data = memberDoc.data();
-        if (data && (data.role === 'owner' || data.role === 'editor' || data.role === 'viewer')) {
+        if (
+          data &&
+          (data.role === 'owner' || data.role === 'editor' || data.role === 'viewer') &&
+          data.active !== false
+        ) {
           this.validatedUid = uid;
           this.validatedUserRole = data.role as AccessRole;
           this.loadProductionRecordsFromLocalStorage();
@@ -1459,6 +1507,248 @@ export class StoreManager {
 
   public async updateMemberRole(email: string, role: AccessRole): Promise<void> {
     await this.addMemberToWorkspace(email, role);
+  }
+
+  // =========================================================================
+  // Phase 0.6: Authoritative UID-Based Workspace Members Management
+  // =========================================================================
+
+  public getWorkspaceMembers(): WorkspaceMemberDoc[] {
+    if (!this.isAuthorized()) return [];
+    return [...this.workspaceMembers];
+  }
+
+  public async fetchWorkspaceMembersDirect(workspaceId?: string): Promise<WorkspaceMemberDoc[]> {
+    if (!this.isAuthorized()) return [];
+    const ws = this.getActiveWorkspace();
+    const wsId = workspaceId || ws?.id || 'ws-main';
+    try {
+      const snap = await getDocs(collection(db, 'workspaces', wsId, 'members'));
+      const members: WorkspaceMemberDoc[] = [];
+      snap.forEach((d) => {
+        const data = d.data();
+        members.push({
+          uid: data.uid || d.id,
+          id: d.id,
+          email: data.email || '',
+          name: data.name || (data.email ? data.email.split('@')[0] : 'Member'),
+          role: (data.role as AccessRole) || 'viewer',
+          active: data.active !== false,
+          addedAt: data.addedAt || '',
+          updatedAt: data.updatedAt || data.addedAt || '',
+        });
+      });
+      this.workspaceMembers = members;
+      this.notify();
+      return members;
+    } catch (err) {
+      console.warn('Error fetching workspace members:', err);
+      return this.workspaceMembers;
+    }
+  }
+
+  public async addWorkspaceMember(params: {
+    uid: string;
+    email: string;
+    name?: string;
+    role: 'editor' | 'viewer';
+    active?: boolean;
+  }): Promise<WorkspaceMemberDoc> {
+    const currentUser = auth.currentUser;
+    if (!currentUser || !currentUser.uid) {
+      throw new Error('Authentication Required: You must be signed in with Google.');
+    }
+    if (!this.isAuthorized()) {
+      throw new Error('Unauthorized: No active authorized session.');
+    }
+    if (this.getUserRole() !== 'owner') {
+      throw new Error('Permission denied: Only workspace owners can manage members.');
+    }
+
+    const ws = this.getActiveWorkspace();
+    const wsId = ws?.id || 'ws-main';
+
+    const cleanUid = (params.uid || '').trim();
+    if (!cleanUid) {
+      throw new Error('Firebase UID is required.');
+    }
+    if (cleanUid.length < 5 || cleanUid.includes(' ') || cleanUid.includes('/')) {
+      throw new Error('Invalid Firebase UID format: Must be at least 5 characters with no spaces or slashes.');
+    }
+
+    const cleanEmail = (params.email || '').toLowerCase().trim();
+    if (!cleanEmail) {
+      throw new Error('Email address is required.');
+    }
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(cleanEmail)) {
+      throw new Error('Invalid email address format.');
+    }
+
+    if (params.role !== 'editor' && params.role !== 'viewer') {
+      throw new Error('Invalid role: Must be either editor or viewer.');
+    }
+
+    // Protect current owner from being added as editor or viewer
+    if (cleanUid === currentUser.uid) {
+      throw new Error('Cannot add yourself as an editor or viewer. You are the workspace owner.');
+    }
+
+    // Prevent duplicate addition
+    const memberDocRef = doc(db, 'workspaces', wsId, 'members', cleanUid);
+    const existingSnap = await getDoc(memberDocRef);
+    if (existingSnap.exists()) {
+      const existingData = existingSnap.data();
+      if (existingData?.role === 'owner') {
+        throw new Error('This UID is already assigned as the workspace owner.');
+      }
+      throw new Error(`A member with UID "${cleanUid}" already exists in this workspace.`);
+    }
+
+    const nowIso = new Date().toISOString();
+    const newMember: WorkspaceMemberDoc = {
+      uid: cleanUid,
+      id: cleanUid,
+      email: cleanEmail,
+      name: (params.name || '').trim() || cleanEmail.split('@')[0],
+      role: params.role,
+      active: params.active !== false,
+      addedAt: nowIso,
+      updatedAt: nowIso,
+    };
+
+    try {
+      await setDoc(memberDocRef, sanitizeForFirestore(newMember));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `workspaces/${wsId}/members/${cleanUid}`);
+      throw err;
+    }
+
+    const existingIdx = this.workspaceMembers.findIndex((m) => m.uid === cleanUid);
+    if (existingIdx >= 0) {
+      this.workspaceMembers[existingIdx] = newMember;
+    } else {
+      this.workspaceMembers.push(newMember);
+    }
+    this.notify();
+    return newMember;
+  }
+
+  public async updateWorkspaceMember(
+    memberUid: string,
+    updates: {
+      role?: 'editor' | 'viewer';
+      name?: string;
+      active?: boolean;
+    }
+  ): Promise<void> {
+    const currentUser = auth.currentUser;
+    if (!currentUser || !currentUser.uid) {
+      throw new Error('Authentication Required: You must be signed in with Google.');
+    }
+    if (!this.isAuthorized()) {
+      throw new Error('Unauthorized: No active authorized session.');
+    }
+    if (this.getUserRole() !== 'owner') {
+      throw new Error('Permission denied: Only workspace owners can update members.');
+    }
+
+    const ws = this.getActiveWorkspace();
+    const wsId = ws?.id || 'ws-main';
+
+    const cleanUid = (memberUid || '').trim();
+    if (!cleanUid) {
+      throw new Error('Member UID is required.');
+    }
+
+    // Owner protection: cannot demote or deactivate self
+    if (cleanUid === currentUser.uid) {
+      throw new Error('Workspace Owner account role or status cannot be modified through this screen.');
+    }
+
+    if (updates.role && updates.role !== 'editor' && updates.role !== 'viewer') {
+      throw new Error('Invalid role: Must be either editor or viewer.');
+    }
+
+    const memberDocRef = doc(db, 'workspaces', wsId, 'members', cleanUid);
+    const existingSnap = await getDoc(memberDocRef);
+    if (!existingSnap.exists()) {
+      throw new Error('Member document not found in workspace.');
+    }
+    const existingData = existingSnap.data();
+    if (existingData?.role === 'owner') {
+      throw new Error('Cannot modify workspace owner role or status.');
+    }
+
+    const nowIso = new Date().toISOString();
+    const docUpdates: Partial<WorkspaceMemberDoc> = {
+      updatedAt: nowIso,
+    };
+    if (updates.role !== undefined) docUpdates.role = updates.role;
+    if (updates.name !== undefined) docUpdates.name = updates.name.trim();
+    if (updates.active !== undefined) docUpdates.active = updates.active;
+
+    try {
+      await setDoc(memberDocRef, sanitizeForFirestore(docUpdates), { merge: true });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `workspaces/${wsId}/members/${cleanUid}`);
+      throw err;
+    }
+
+    const idx = this.workspaceMembers.findIndex((m) => m.uid === cleanUid);
+    if (idx >= 0) {
+      this.workspaceMembers[idx] = {
+        ...this.workspaceMembers[idx],
+        ...docUpdates,
+      };
+      this.notify();
+    }
+  }
+
+  public async removeWorkspaceMember(memberUid: string): Promise<void> {
+    const currentUser = auth.currentUser;
+    if (!currentUser || !currentUser.uid) {
+      throw new Error('Authentication Required: You must be signed in with Google.');
+    }
+    if (!this.isAuthorized()) {
+      throw new Error('Unauthorized: No active authorized session.');
+    }
+    if (this.getUserRole() !== 'owner') {
+      throw new Error('Permission denied: Only workspace owners can remove members.');
+    }
+
+    const ws = this.getActiveWorkspace();
+    const wsId = ws?.id || 'ws-main';
+
+    const cleanUid = (memberUid || '').trim();
+    if (!cleanUid) {
+      throw new Error('Member UID is required.');
+    }
+
+    // Owner protection
+    if (cleanUid === currentUser.uid) {
+      throw new Error('Cannot remove yourself as workspace owner.');
+    }
+
+    const memberDocRef = doc(db, 'workspaces', wsId, 'members', cleanUid);
+    const existingSnap = await getDoc(memberDocRef);
+    if (!existingSnap.exists()) {
+      return;
+    }
+    const existingData = existingSnap.data();
+    if (existingData?.role === 'owner') {
+      throw new Error('Cannot remove workspace owner membership.');
+    }
+
+    try {
+      await deleteDoc(memberDocRef);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `workspaces/${wsId}/members/${cleanUid}`);
+      throw err;
+    }
+
+    this.workspaceMembers = this.workspaceMembers.filter((m) => m.uid !== cleanUid);
+    this.notify();
   }
 
   public async addGroupToWorkspace(name: string, memberEmails: string[], role: AccessRole): Promise<void> {

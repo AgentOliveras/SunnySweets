@@ -165,11 +165,14 @@ export interface ProductionHistoryEntry {
 }
 
 export interface WorkspaceMemberDoc {
-  id: string; // member uid
-  role: AccessRole;
+  uid: string; // member uid (document ID)
+  id?: string; // backwards compatibility
   email: string;
-  name?: string;
+  name: string;
+  role: AccessRole;
+  active: boolean;
   addedAt: string;
+  updatedAt: string;
 }
 
 export interface UserSettings {

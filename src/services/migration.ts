@@ -292,12 +292,16 @@ export async function executePhase0Migration(): Promise<MigrationExecutionResult
 
     // 2. Create / Update Owner Membership Subcollection: workspaces/ws-main/members/{ownerUid}
     const memberDocRef = doc(db, 'workspaces', targetWorkspaceId, 'members', ownerUid);
+    const nowIso = new Date().toISOString();
     const memberData: WorkspaceMemberDoc = {
       id: ownerUid,
+      uid: ownerUid,
       role: 'owner',
       email: ownerEmail,
       name: ownerName,
-      addedAt: new Date().toISOString(),
+      active: true,
+      addedAt: nowIso,
+      updatedAt: nowIso,
     };
     await setDoc(memberDocRef, sanitizeForFirestore(memberData), { merge: true });
     migratedCounts.workspaceMembers++;

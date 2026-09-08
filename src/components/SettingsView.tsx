@@ -44,6 +44,7 @@ import {
   MigrationExecutionResult,
 } from '../services/migration';
 import { BrandingSettings } from './BrandingSettings';
+import { MembersManagement } from './MembersManagement';
 
 interface SettingsViewProps {
   settings: UserSettings;
@@ -1035,6 +1036,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
         {/* Workspace Branding & Appearance (Phase 0.5) */}
         <BrandingSettings onSuccessNotice={showNotification} />
+
+        {/* Workspace Members & Access Management (Phase 0.6) */}
+        <MembersManagement onSuccessNotice={showNotification} />
 
         {/* Business Branding & Waste Defaults */}
         <form

@@ -124,12 +124,15 @@
       "description": "Membership document enforcing zero-trust role-based access control",
       "type": "object",
       "properties": {
-        "role": { "type": "string", "enum": ["owner", "editor", "viewer"] },
+        "uid": { "type": "string" },
         "email": { "type": "string" },
         "name": { "type": "string" },
-        "addedAt": { "type": "string" }
+        "role": { "type": "string", "enum": ["owner", "editor", "viewer"] },
+        "active": { "type": "boolean" },
+        "addedAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
       },
-      "required": ["role", "email"]
+      "required": ["uid", "email", "role", "active"]
     }
   },
   "firestore": {
