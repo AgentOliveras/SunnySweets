@@ -1,4 +1,4 @@
-import { WeightUnit, VolumeUnit, MeasurementUnit, PeanutButterJarsDetail } from '../types';
+import { WeightUnit, VolumeUnit, MeasurementUnit, PeanutButterJarsDetail, ProductionMeasurementDisplayMode } from '../types';
 
 export const WEIGHT_TO_GRAMS: Record<WeightUnit, number> = {
   g: 1,
@@ -7,7 +7,19 @@ export const WEIGHT_TO_GRAMS: Record<WeightUnit, number> = {
   lb: 453.59237,
 };
 
-export const GRAMS_PER_PB_JAR = 1816; // 4 lbs commercial jar (4 * 454g = 1816 grams, yielding 1928g -> 1 jar + 112 grams)
+/**
+ * BUSINESS-SPECIFIC PACKAGE CONVERSION:
+ * Operational Peanut Butter "4 lb Jar" is fixed at 1816 g (commercial bakery packaging
+ * convention based on 4 x 454g).
+ *
+ * NOTE: This is NOT a generic 4-lb mass conversion!
+ * Generic scientific weight conversion must strictly use WEIGHT_TO_GRAMS.lb (453.59237 g/lb),
+ * which yields: 4 lb = 1814.36948 g.
+ *
+ * Operational Peanut Butter "4 lb Jar" = 1816 g and Generic 4 lb weight = 1814.36948 g
+ * are intentionally separate concepts and must NEVER substitute for one another.
+ */
+export const GRAMS_PER_PB_JAR = 1816;
 
 export const VOLUME_TO_ML: Record<VolumeUnit, number> = {
   ml: 1,
@@ -16,13 +28,65 @@ export const VOLUME_TO_ML: Record<VolumeUnit, number> = {
   tbsp: 14.78676478125,
   cup: 236.5882365,
   fl_oz: 29.5735295625,
+  pt: 473.176473,
+  qt: 946.352946,
+  gal: 3785.411784,
 };
+
+export const VOLUME_UNIT_ALIASES: Record<string, VolumeUnit> = {
+  ml: 'ml',
+  milliliter: 'ml',
+  milliliters: 'ml',
+  l: 'l',
+  liter: 'l',
+  liters: 'l',
+  litre: 'l',
+  litres: 'l',
+  tsp: 'tsp',
+  teaspoon: 'tsp',
+  teaspoons: 'tsp',
+  tbsp: 'tbsp',
+  tablespoon: 'tbsp',
+  tablespoons: 'tbsp',
+  cup: 'cup',
+  cups: 'cup',
+  fl_oz: 'fl_oz',
+  'fl oz': 'fl_oz',
+  floz: 'fl_oz',
+  'fluid ounce': 'fl_oz',
+  'fluid ounces': 'fl_oz',
+  pt: 'pt',
+  pint: 'pt',
+  pints: 'pt',
+  qt: 'qt',
+  quart: 'qt',
+  quarts: 'qt',
+  gal: 'gal',
+  gallon: 'gal',
+  gallons: 'gal',
+};
+
+export function normalizeVolumeUnit(unit: string): VolumeUnit | null {
+  if (!unit) return null;
+  const clean = unit.trim().toLowerCase();
+  if (clean in VOLUME_UNIT_ALIASES) return VOLUME_UNIT_ALIASES[clean];
+  if (clean in VOLUME_TO_ML) return clean as VolumeUnit;
+  return null;
+}
 
 export const WEIGHT_UNITS: { value: WeightUnit; label: string }[] = [
   { value: 'g', label: 'Grams (g)' },
   { value: 'kg', label: 'Kilograms (kg)' },
   { value: 'oz', label: 'Ounces (oz)' },
   { value: 'lb', label: 'Pounds (lb)' },
+];
+
+export const PRODUCTION_DISPLAY_MODES: { value: ProductionMeasurementDisplayMode; label: string; shortLabel: string }[] = [
+  { value: 'as_entered', label: 'As Entered', shortLabel: 'As Entered' },
+  { value: 'g', label: 'Grams (g)', shortLabel: 'g' },
+  { value: 'kg', label: 'Kilograms (kg)', shortLabel: 'kg' },
+  { value: 'oz', label: 'Ounces (oz)', shortLabel: 'oz' },
+  { value: 'lb', label: 'Pounds (lb)', shortLabel: 'lb' },
 ];
 
 export const ALL_UNITS: { value: string; label: string; category: 'weight' | 'volume' | 'discrete' }[] = [
@@ -36,6 +100,9 @@ export const ALL_UNITS: { value: string; label: string; category: 'weight' | 'vo
   { value: 'tbsp', label: 'Tablespoons (tbsp)', category: 'volume' },
   { value: 'cup', label: 'Cups', category: 'volume' },
   { value: 'fl_oz', label: 'Fluid Ounces (fl oz)', category: 'volume' },
+  { value: 'pt', label: 'Pints (pt)', category: 'volume' },
+  { value: 'qt', label: 'Quarts (qt)', category: 'volume' },
+  { value: 'gal', label: 'Gallons (gal)', category: 'volume' },
   { value: 'pcs', label: 'Pieces (pcs)', category: 'discrete' },
   { value: 'units', label: 'Units', category: 'discrete' },
   { value: 'eggs', label: 'Eggs', category: 'discrete' },
@@ -44,21 +111,43 @@ export const ALL_UNITS: { value: string; label: string; category: 'weight' | 'vo
 ];
 
 export function isWeightUnit(unit: string): unit is WeightUnit {
-  return unit in WEIGHT_TO_GRAMS;
+  if (!unit) return false;
+  return (unit.trim().toLowerCase()) in WEIGHT_TO_GRAMS;
 }
 
 export function isVolumeUnit(unit: string): unit is VolumeUnit {
-  return unit in VOLUME_TO_ML;
+  return normalizeVolumeUnit(unit) !== null;
+}
+
+/**
+ * Formats a numeric value for clean human-readable input display without IEEE-754 floating-point artifacts.
+ * Strips unnecessary trailing zeros and eliminates noise like 49.9999999997 or 50.0000000003.
+ * Examples:
+ *   50 -> "50"
+ *   49.9999999997 -> "50"
+ *   2.50000000001 -> "2.5"
+ *   12.7500000003 -> "12.75"
+ */
+export function formatCleanNumeric(val: number | null | undefined): string {
+  if (val === null || val === undefined || isNaN(val)) return '';
+  const rounded = parseFloat(Number(val).toPrecision(10));
+  return String(rounded);
 }
 
 /**
  * Check if ingredient name represents dairy butter (e.g. Butter, Unsalted Butter, Salted Butter, Brown Butter, etc.)
  * Excludes nut, fruit, and plant butters like Peanut Butter, Almond Butter, Apple Butter, etc.
+ * Checks both authoritative ingredient name and category metadata if available.
  */
-export function isButterIngredient(name?: string): boolean {
+export function isButterIngredient(name?: string, category?: string): boolean {
+  // If category indicates nut or seed or plant butters, it's not dairy butter
+  if (category && /(nut\s*butter|seed\s*butter|fruit\s*butter)/i.test(category)) {
+    return false;
+  }
   if (!name) return false;
   const trimmed = name.trim();
-  if (/(peanut|almond|apple|cookie|sunflower|cashew|cocoa|hazelnut|soy)\s*butter/i.test(trimmed)) {
+  // Exclude nut, fruit, and plant butters
+  if (/(peanut|almond|apple|cookie|sunflower|cashew|cocoa|hazelnut|soy|seed|shea)\s*butter/i.test(trimmed)) {
     return false;
   }
   return /\bbutter\b/i.test(trimmed);
@@ -125,10 +214,10 @@ export function calculatePeanutButterJarsDetail(totalGrams: number): PeanutButte
 
 /**
  * Helper to determine decimal precision for displaying ingredient amounts and totals:
- * - Butter: always 2 decimal points (in lbs).
- * - Peanut Butter: always 2 decimal points (in jars).
- * - Grams ('g'): 0 decimal points (always rounded to whole integers, no decimals).
- * - Other units: uses user settings or fallback decimals.
+ * - Grams ('g'): ALWAYS 0 decimal points (rounded to whole integers, no decimals), even when switching butter to grams.
+ * - Butter & ingredients in 'lb': always exactly 2 decimal points (minDecimals: 2, maxDecimals: 2, e.g. 11.00 lb, 7.00 lb, 3.50 lb).
+ * - Peanut Butter in 'jars': always 2 decimal points.
+ * - Other units: uses user settings or fallback decimals with minDecimals 0.
  */
 export function getDisplayDecimals(
   unit?: string,
@@ -136,16 +225,28 @@ export function getDisplayDecimals(
   customDecimals?: number,
   isPeanutButter = false
 ): { maxDecimals: number; minDecimals: number } {
-  if (isButter || isPeanutButter) {
-    return { maxDecimals: 2, minDecimals: 2 };
-  }
   const normalizedUnit = (unit || '').trim().toLowerCase();
-  if (normalizedUnit === 'jars' || normalizedUnit === 'jar') {
-    return { maxDecimals: 2, minDecimals: 2 };
-  }
+
+  // Grams are ALWAYS formatted as whole integers (0 decimals), even for butter when switched to grams
   if (normalizedUnit === 'g' || normalizedUnit === 'gram' || normalizedUnit === 'grams') {
     return { maxDecimals: 0, minDecimals: 0 };
   }
+
+  // Peanut butter in jars: always 2 decimals
+  if (isPeanutButter || normalizedUnit === 'jars' || normalizedUnit === 'jar') {
+    return { maxDecimals: 2, minDecimals: 2 };
+  }
+
+  // Butter or any ingredient displayed in pounds (lb): always exactly 2 decimals (e.g. 11.00 lb, 7.00 lb, 3.50 lb)
+  if (normalizedUnit === 'lb' || normalizedUnit === 'lbs') {
+    return { maxDecimals: 2, minDecimals: 2 };
+  }
+
+  // Butter in general: 2 decimals
+  if (isButter) {
+    return { maxDecimals: 2, minDecimals: 2 };
+  }
+
   const max = customDecimals !== undefined ? customDecimals : 2;
   return { maxDecimals: max, minDecimals: 0 };
 }
@@ -178,17 +279,21 @@ export function convertWeight(value: number, fromUnit: WeightUnit, toUnit: Weigh
 /**
  * Convert value between volume units.
  */
-export function convertVolume(value: number, fromUnit: VolumeUnit, toUnit: VolumeUnit): number {
-  if (fromUnit === toUnit) return value;
-  const ml = value * VOLUME_TO_ML[fromUnit];
-  return ml / VOLUME_TO_ML[toUnit];
+export function convertVolume(value: number, fromUnit: string, toUnit: string): number {
+  const normFrom = normalizeVolumeUnit(fromUnit);
+  const normTo = normalizeVolumeUnit(toUnit);
+  if (!normFrom || !normTo) return value;
+  if (normFrom === normTo) return value;
+  const ml = value * VOLUME_TO_ML[normFrom];
+  return ml / VOLUME_TO_ML[normTo];
 }
 
 /**
  * Try to convert an ingredient quantity to target default weight unit.
- * If volume and density is present, converts volume -> ml -> grams -> target unit.
+ * If volume and explicit density is present (> 0), converts volume -> ml -> grams -> target unit.
  * If weight, converts weight -> grams -> target unit.
- * Otherwise returns null (discrete units like pieces stay discrete).
+ * NEVER defaults density to 1.0! Returns null if density is missing.
+ * Discrete units like pieces stay discrete (returns null).
  */
 export function tryConvertToWeight(
   quantity: number,
@@ -199,8 +304,9 @@ export function tryConvertToWeight(
   if (isWeightUnit(unit)) {
     return convertWeight(quantity, unit, targetUnit);
   }
-  if (isVolumeUnit(unit) && densityGramsPerMl && densityGramsPerMl > 0) {
-    const ml = quantity * VOLUME_TO_ML[unit];
+  const normVol = normalizeVolumeUnit(unit);
+  if (normVol && densityGramsPerMl && densityGramsPerMl > 0) {
+    const ml = quantity * VOLUME_TO_ML[normVol];
     const grams = ml * densityGramsPerMl;
     return fromGrams(grams, targetUnit);
   }
@@ -208,15 +314,50 @@ export function tryConvertToWeight(
 }
 
 /**
+ * Transforms an ingredient's quantity and unit according to the selected ProductionMeasurementDisplayMode.
+ * - 'as_entered': preserves original unit and quantity.
+ * - 'g' | 'kg' | 'oz' | 'lb': converts compatible weight units to the requested unit.
+ *   Non-weight units (discrete count or volume without density) remain in their original units.
+ */
+export function convertIngredientForDisplay(
+  quantity: number,
+  unit: string,
+  displayMode: ProductionMeasurementDisplayMode = 'as_entered',
+  densityGramsPerMl?: number
+): { quantity: number; unit: string; wasConverted: boolean } {
+  if (displayMode === 'as_entered' || !displayMode) {
+    return { quantity, unit, wasConverted: false };
+  }
+
+  // Weight unit conversion
+  if (isWeightUnit(unit) && isWeightUnit(displayMode)) {
+    const converted = convertWeight(quantity, unit as WeightUnit, displayMode as WeightUnit);
+    return { quantity: converted, unit: displayMode, wasConverted: true };
+  }
+
+  // Volume unit conversion only if explicit density is provided
+  if (isVolumeUnit(unit) && isWeightUnit(displayMode) && densityGramsPerMl && densityGramsPerMl > 0) {
+    const converted = tryConvertToWeight(quantity, unit, displayMode as WeightUnit, densityGramsPerMl);
+    if (converted !== null) {
+      return { quantity: converted, unit: displayMode, wasConverted: true };
+    }
+  }
+
+  // Discrete items or volume without density remain in original unit
+  return { quantity, unit, wasConverted: false };
+}
+
+/**
  * High precision formatting function that avoids rounding errors and trailing zeros.
  * When maxDecimals is 0, it rounds the value to the nearest whole integer with no decimal places.
  */
 export function formatNumber(value: number, maxDecimals = 2, minDecimals = 0): string {
-  if (value === 0) return '0';
   if (isNaN(value) || !isFinite(value)) return '0';
   
   const effectiveMax = Math.max(0, maxDecimals);
   const effectiveMin = Math.min(minDecimals, effectiveMax);
+
+  if (value === 0 && effectiveMin === 0) return '0';
 
   // Use Intl.NumberFormat for locale awareness and precision
   const formatter = new Intl.NumberFormat('en-US', {
@@ -244,8 +385,9 @@ export function getUnitLabel(unit: string): string {
 
 /**
  * Converts a single ingredient to the user's preferred measuring unit if possible.
- * If the ingredient is in a weight unit (or volume unit with density/assumed density 1.0 for liquids),
+ * If the ingredient is in a weight unit (or volume unit with explicit density),
  * it converts its quantity and updates its unit to targetUnit.
+ * Never guesses density for volume units!
  */
 export function standardizeIngredientToUnit(
   ingredient: { id?: string; name: string; quantity: number | string; unit: string; notes?: string; wastePercent?: number; densityGramsPerMl?: number },
@@ -269,7 +411,7 @@ export function standardizeIngredientToUnit(
     return ingredient;
   }
 
-  const density = ingredient.densityGramsPerMl || (isVolumeUnit(ingredient.unit) ? 1.0 : undefined);
+  const density = ingredient.densityGramsPerMl;
   const convertedQty = tryConvertToWeight(qty, ingredient.unit, targetUnit, density);
 
   if (convertedQty !== null) {

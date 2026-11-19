@@ -1,22 +1,30 @@
 import React, { useState } from 'react';
-import { Scale, Plus, Edit2, Trash2, ShieldAlert, X } from 'lucide-react';
-import { Mixer, WeightUnit } from '../types';
+import { Scale, Plus, Edit2, Trash2, ShieldAlert, X, Eye } from 'lucide-react';
+import { AccessRole, Mixer, WeightUnit } from '../types';
 import { WEIGHT_UNITS } from '../utils/units';
+import { store } from '../services/store';
 
 interface MixerManagerProps {
   mixers: Mixer[];
+  userRole?: AccessRole | null;
   onSaveMixer: (mixer: Mixer) => void;
   onDeleteMixer: (id: string) => void;
 }
 
 export const MixerManager: React.FC<MixerManagerProps> = ({
   mixers,
+  userRole,
   onSaveMixer,
   onDeleteMixer,
 }) => {
+  const effectiveRole = userRole !== undefined ? userRole : store.getUserRole();
+  const isEditorOrOwner = effectiveRole === 'owner' || effectiveRole === 'editor';
   const [editingMixer, setEditingMixer] = useState<Mixer | null>(null);
+  const [validationError, setValidationError] = useState<string | null>(null);
 
   const handleCreateNew = () => {
+    if (!isEditorOrOwner) return;
+    setValidationError(null);
     setEditingMixer({
       id: `mixer-${Date.now()}`,
       userId: '',
@@ -30,17 +38,31 @@ export const MixerManager: React.FC<MixerManagerProps> = ({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!editingMixer) return;
+    if (!isEditorOrOwner || !editingMixer) return;
     if (!editingMixer.name.trim()) {
-      alert('Please enter a mixer name.');
+      setValidationError('Please enter a mixer name.');
       return;
     }
+    setValidationError(null);
     onSaveMixer(editingMixer);
     setEditingMixer(null);
   };
 
   return (
     <div className="space-y-6 pb-20 md:pb-8">
+      {/* Viewer Notice Banner */}
+      {!isEditorOrOwner && (
+        <div
+          id="mixer-viewer-readonly-banner"
+          className="bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 rounded-xl px-4 py-3 flex items-center gap-3 text-xs text-amber-900 dark:text-amber-200"
+        >
+          <Eye className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" />
+          <span>
+            <strong>Read-Only Access:</strong> You are viewing mixer capacities with Viewer permissions. Only Editors and Owners can add, edit, or delete mixer equipment.
+          </span>
+        </div>
+      )}
+
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
@@ -53,14 +75,16 @@ export const MixerManager: React.FC<MixerManagerProps> = ({
           </p>
         </div>
 
-        <button
-          id="mixer-add-btn"
-          onClick={handleCreateNew}
-          className="inline-flex items-center justify-center gap-2 bg-[#5A534B] hover:bg-[#47413A] dark:bg-[#3D3732] text-white font-bold px-4 py-2.5 rounded-xl text-sm transition shadow-sm cursor-pointer"
-        >
-          <Plus className="w-4 h-4" />
-          <span>Add Mixer</span>
-        </button>
+        {isEditorOrOwner && (
+          <button
+            id="mixer-add-btn"
+            onClick={handleCreateNew}
+            className="inline-flex items-center justify-center gap-2 bg-[#5A534B] hover:bg-[#47413A] dark:bg-[#3D3732] text-white font-bold px-4 py-2.5 rounded-xl text-sm transition shadow-sm cursor-pointer"
+          >
+            <Plus className="w-4 h-4" />
+            <span>Add Mixer</span>
+          </button>
+        )}
       </div>
 
       {/* Mixer Cards Grid */}
@@ -90,32 +114,37 @@ export const MixerManager: React.FC<MixerManagerProps> = ({
               </p>
             </div>
 
-            <div className="flex items-center justify-end gap-2 pt-4 mt-4 border-t border-[#EEECE8] dark:border-[#332F2B]">
-              <button
-                id={`mixer-edit-btn-${mixer.id}`}
-                onClick={() => setEditingMixer(mixer)}
-                className="p-1.5 text-[#8B7E74] hover:text-[#5A534B] hover:bg-[#F5F2ED] dark:hover:bg-[#25221F] rounded-lg transition cursor-pointer"
-              >
-                <Edit2 className="w-4 h-4" />
-              </button>
-              <button
-                id={`mixer-delete-btn-${mixer.id}`}
-                onClick={() => {
-                  if (confirm(`Delete mixer "${mixer.name}"?`)) {
-                    onDeleteMixer(mixer.id);
-                  }
-                }}
-                className="p-1.5 text-[#C97B63] hover:text-red-700 hover:bg-[#FDF2F0] dark:hover:bg-[#2C1916] rounded-lg transition cursor-pointer"
-              >
-                <Trash2 className="w-4 h-4" />
-              </button>
-            </div>
+            {isEditorOrOwner && (
+              <div className="flex items-center justify-end gap-2 pt-4 mt-4 border-t border-[#EEECE8] dark:border-[#332F2B]">
+                <button
+                  id={`mixer-edit-btn-${mixer.id}`}
+                  onClick={() => {
+                    setValidationError(null);
+                    setEditingMixer(mixer);
+                  }}
+                  className="p-1.5 text-[#8B7E74] hover:text-[#5A534B] hover:bg-[#F5F2ED] dark:hover:bg-[#25221F] rounded-lg transition cursor-pointer"
+                >
+                  <Edit2 className="w-4 h-4" />
+                </button>
+                <button
+                  id={`mixer-delete-btn-${mixer.id}`}
+                  onClick={() => {
+                    if (confirm(`Delete mixer "${mixer.name}"?`)) {
+                      onDeleteMixer(mixer.id);
+                    }
+                  }}
+                  className="p-1.5 text-[#C97B63] hover:text-red-700 hover:bg-[#FDF2F0] dark:hover:bg-[#2C1916] rounded-lg transition cursor-pointer"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
+            )}
           </div>
         ))}
       </div>
 
       {/* Mixer Modal */}
-      {editingMixer && (
+      {isEditorOrOwner && editingMixer && (
         <div className="fixed inset-0 z-50 bg-[#2D2926]/60 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-white dark:bg-[#1E1B18] border border-[#E5E1DA] dark:border-[#2D2925] rounded-xl w-full max-w-lg shadow-2xl overflow-hidden">
             <div className="p-5 border-b border-[#EEECE8] dark:border-[#332F2B] flex items-center justify-between">
@@ -128,6 +157,11 @@ export const MixerManager: React.FC<MixerManagerProps> = ({
             </div>
 
             <form onSubmit={handleSubmit} className="p-6 space-y-4">
+              {validationError && (
+                <div className="p-2.5 rounded-lg bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 text-xs font-semibold text-rose-700 dark:text-rose-300">
+                  {validationError}
+                </div>
+              )}
               <div>
                 <label className="block text-xs font-semibold text-[#8B7E74] dark:text-[#A39E93] mb-1">
                   Mixer Equipment Name *

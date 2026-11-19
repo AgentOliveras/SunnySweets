@@ -1,10 +1,10 @@
-import React, { Component, ErrorInfo, ReactNode } from 'react';
+import React from 'react';
 import { AlertCircle, RefreshCw } from 'lucide-react';
 
 interface Props {
   sectionTitle?: string;
   fallbackMessage?: string;
-  children: ReactNode;
+  children: React.ReactNode;
   onReset?: () => void;
 }
 
@@ -13,13 +13,14 @@ interface State {
   error: Error | null;
 }
 
-export class SettingsSectionErrorBoundary extends Component<Props, State> {
+export class SettingsSectionErrorBoundary extends React.Component<Props, State> {
+  override state: State = {
+    hasError: false,
+    error: null,
+  };
+
   constructor(props: Props) {
     super(props);
-    this.state = {
-      hasError: false,
-      error: null,
-    };
   }
 
   static getDerivedStateFromError(error: Error): State {
@@ -29,7 +30,7 @@ export class SettingsSectionErrorBoundary extends Component<Props, State> {
     };
   }
 
-  componentDidCatch(error: Error, errorInfo: ErrorInfo): void {
+  override componentDidCatch(error: Error, errorInfo: React.ErrorInfo): void {
     console.error(`[SettingsSectionErrorBoundary] Error in section "${this.props.sectionTitle || 'Unknown'}":`, error, errorInfo);
   }
 
@@ -43,7 +44,7 @@ export class SettingsSectionErrorBoundary extends Component<Props, State> {
     });
   };
 
-  render(): ReactNode {
+  override render(): React.ReactNode {
     if (this.state.hasError) {
       return (
         <div className="bg-white dark:bg-[#1E1B18] border border-red-200 dark:border-red-900/40 rounded-xl p-6 shadow-sm space-y-4">
@@ -83,3 +84,4 @@ export class SettingsSectionErrorBoundary extends Component<Props, State> {
     return this.props.children;
   }
 }
+

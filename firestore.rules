@@ -22,35 +22,112 @@ service cloud.firestore {
       return request.auth != null && request.auth.uid != null;
     }
 
+    function hasActiveMemberDoc(workspaceId) {
+      return exists(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)).data.active == true &&
+             (get(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)).data.role in ['owner', 'editor', 'viewer']);
+    }
+
+    function hasUnrevokedWorkspaceOwnerFallback(workspaceId) {
+      return exists(/databases/$(database)/documents/workspaces/$(workspaceId)) &&
+             get(/databases/$(database)/documents/workspaces/$(workspaceId)).data.ownerId == request.auth.uid &&
+             (!exists(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)) ||
+              get(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)).data.active == true);
+    }
+
     function isWorkspaceMember(workspaceId) {
-      return isSignedIn() && exists(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid));
+      return isSignedIn() && (
+        hasActiveMemberDoc(workspaceId) ||
+        hasUnrevokedWorkspaceOwnerFallback(workspaceId)
+      );
     }
 
     function getMemberRole(workspaceId) {
-      return exists(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid))
+      return hasActiveMemberDoc(workspaceId)
         ? get(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)).data.role
         : null;
     }
 
     function isWorkspaceOwner(workspaceId) {
-      return isSignedIn() && getMemberRole(workspaceId) == 'owner';
+      return isSignedIn() && (
+        getMemberRole(workspaceId) == 'owner' ||
+        hasUnrevokedWorkspaceOwnerFallback(workspaceId)
+      );
     }
 
     function isWorkspaceEditor(workspaceId) {
-      return isSignedIn() && (getMemberRole(workspaceId) == 'editor' || getMemberRole(workspaceId) == 'owner');
+      return isSignedIn() && (
+        getMemberRole(workspaceId) == 'editor' ||
+        isWorkspaceOwner(workspaceId)
+      );
+    }
+
+    function isNewlyCreatedWorkspaceOwner(workspaceId) {
+      return !exists(/databases/$(database)/documents/workspaces/$(workspaceId)) &&
+             getAfter(/databases/$(database)/documents/workspaces/$(workspaceId)).data.ownerId == request.auth.uid;
     }
 
     // --- Workspaces & Members Subcollections ---
     match /workspaces/{workspaceId} {
       allow read: if isWorkspaceMember(workspaceId);
-      allow create: if isSignedIn() && request.resource.data.ownerId == request.auth.uid;
-      allow update: if isWorkspaceOwner(workspaceId) && request.resource.data.ownerId == resource.data.ownerId;
+      allow create: if isSignedIn() &&
+                       request.resource.data.ownerId == request.auth.uid &&
+                       // Authoritative duplicate workspace prevention:
+                       // 1. User must NOT already own a workspace in users/{uid}
+                       (
+                         !exists(/databases/$(database)/documents/users/$(request.auth.uid)) ||
+                         !('ownedWorkspaceId' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data) ||
+                         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.ownedWorkspaceId == null
+                       ) &&
+                       // 2. Atomic batch invariant: profile must bind ownedWorkspaceId in the same operation
+                       getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.ownedWorkspaceId == workspaceId &&
+                       // Anti-tamper: Client cannot self-grant strategic partner metadata or billing fields on creation
+                       (!('strategicPartner' in request.resource.data) || request.resource.data.strategicPartner == false) &&
+                       (!('billingSource' in request.resource.data));
+      allow update: if (
+                        isWorkspaceOwner(workspaceId) &&
+                        request.resource.data.ownerId == resource.data.ownerId &&
+                        // Anti-tamper: Client cannot manipulate strategic partner status or billing source
+                        (!('strategicPartner' in request.resource.data) ||
+                         ('strategicPartner' in resource.data && request.resource.data.strategicPartner == resource.data.strategicPartner)) &&
+                        (!('billingSource' in request.resource.data) ||
+                         ('billingSource' in resource.data && request.resource.data.billingSource == resource.data.billingSource))
+                      ) || (
+                        isWorkspaceEditor(workspaceId) &&
+                        request.resource.data.ownerId == resource.data.ownerId &&
+                        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['productionOptionOrder', 'updatedAt']) &&
+                        request.resource.data.productionOptionOrder is list &&
+                        request.resource.data.productionOptionOrder.size() <= 500 &&
+                        (!('updatedAt' in request.resource.data) ||
+                         (request.resource.data.updatedAt is string && request.resource.data.updatedAt.size() <= 64))
+                      );
       allow delete: if isWorkspaceOwner(workspaceId);
 
-      // Members subcollection: strictly UID-based, only existing owner can manage
+      // Members subcollection: strictly UID-based, only existing owner or initial creator can create
       match /members/{memberId} {
         allow read: if isWorkspaceMember(workspaceId);
-        allow create, update, delete: if isWorkspaceOwner(workspaceId);
+        allow create: if (
+          // Existing workspace owner adding or inviting a member
+          isWorkspaceOwner(workspaceId)
+        ) || (
+          // Initial owner bootstrap ONLY for a newly created workspace in the current atomic batch
+          isSignedIn() &&
+          memberId == request.auth.uid &&
+          request.resource.data.uid == request.auth.uid &&
+          request.resource.data.role == 'owner' &&
+          request.resource.data.active == true &&
+          isNewlyCreatedWorkspaceOwner(workspaceId)
+        );
+        allow update: if isWorkspaceOwner(workspaceId);
+        allow delete: if isWorkspaceOwner(workspaceId);
+      }
+
+      // Billing subcollection: strictly workspace-scoped
+      // Workspace members may read billing/entitlement info appropriate to their membership
+      // Client code must NOT be able to write or grant itself active subscription status
+      match /billing/{billingDoc} {
+        allow read: if isWorkspaceMember(workspaceId);
+        allow write: if false; // Server-only / Admin SDK authoritative writes
       }
     }
 
@@ -72,7 +149,7 @@ service cloud.firestore {
 
       allow delete: if isSignedIn() &&
         resource.data.workspaceId != null &&
-        isWorkspaceEditor(resource.data.workspaceId);
+        isWorkspaceOwner(resource.data.workspaceId);
     }
 
     // --- Presets Collection ---
@@ -84,16 +161,18 @@ service cloud.firestore {
       allow create: if isSignedIn() &&
         request.resource.data.workspaceId != null &&
         request.resource.data.workspaceId is string &&
+        (!('productionEnabled' in request.resource.data) || request.resource.data.productionEnabled is bool) &&
         isWorkspaceEditor(request.resource.data.workspaceId);
 
       allow update: if isSignedIn() &&
         resource.data.workspaceId != null &&
         request.resource.data.workspaceId == resource.data.workspaceId &&
+        (!('productionEnabled' in request.resource.data) || request.resource.data.productionEnabled is bool) &&
         isWorkspaceEditor(resource.data.workspaceId);
 
       allow delete: if isSignedIn() &&
         resource.data.workspaceId != null &&
-        isWorkspaceEditor(resource.data.workspaceId);
+        isWorkspaceOwner(resource.data.workspaceId);
     }
 
     // --- Mixers Collection ---
@@ -157,6 +236,47 @@ service cloud.firestore {
       allow delete: if isSignedIn() &&
         resource.data.workspaceId != null &&
         isWorkspaceEditor(resource.data.workspaceId);
+    }
+
+    // --- Product Development & Quoting Collection (Management Only: Owner & Editor) ---
+    match /product_projects/{projectId} {
+      allow read: if isSignedIn() &&
+        (resource == null || (resource.data.workspaceId != null && isWorkspaceEditor(resource.data.workspaceId)));
+
+      allow create: if isSignedIn() &&
+        request.resource.data.workspaceId != null &&
+        request.resource.data.workspaceId is string &&
+        isWorkspaceEditor(request.resource.data.workspaceId);
+
+      allow update: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        request.resource.data.workspaceId == resource.data.workspaceId &&
+        isWorkspaceEditor(resource.data.workspaceId);
+
+      allow delete: if isSignedIn() &&
+        resource.data.workspaceId != null &&
+        isWorkspaceEditor(resource.data.workspaceId);
+    }
+
+    // --- User Profile & Membership Index (Private to authenticated UID) ---
+    match /users/{userId} {
+      allow read: if isSignedIn() && request.auth.uid == userId;
+      allow create: if isSignedIn() && request.auth.uid == userId;
+      allow update: if isSignedIn() && request.auth.uid == userId && (
+        // Authoritative anti-duplication: cannot wipe or alter ownedWorkspaceId once set
+        (!('ownedWorkspaceId' in resource.data) ||
+        resource.data.ownedWorkspaceId == null ||
+        request.resource.data.ownedWorkspaceId == resource.data.ownedWorkspaceId) &&
+        // Anti-tamper: cannot reset trialConsumedForOwnedWorkspace once set to true
+        (!('trialConsumedForOwnedWorkspace' in resource.data) ||
+        resource.data.trialConsumedForOwnedWorkspace != true ||
+        request.resource.data.trialConsumedForOwnedWorkspace == true)
+      );
+      allow delete: if false; // Deny deletion to prevent resetting ownedWorkspaceId
+
+      match /workspaceMemberships/{workspaceId} {
+        allow read, write: if isSignedIn() && request.auth.uid == userId;
+      }
     }
 
     // --- User Settings (Private to authenticated UID) ---

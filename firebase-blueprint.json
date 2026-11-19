@@ -30,7 +30,8 @@
         "weightUnit": { "type": "string" },
         "quantityPerUnit": { "type": "number" },
         "unitName": { "type": "string" },
-        "expectedYield": { "type": "string" }
+        "expectedYield": { "type": "string" },
+        "productionEnabled": { "type": "boolean" }
       },
       "required": ["workspaceId", "name", "finishedWeight", "weightUnit", "quantityPerUnit"]
     },
@@ -114,6 +115,10 @@
             "paletteId": { "type": "string" }
           }
         },
+        "productionOptionOrder": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
         "createdAt": { "type": "string" },
         "updatedAt": { "type": "string" }
       },
@@ -133,9 +138,67 @@
         "updatedAt": { "type": "string" }
       },
       "required": ["uid", "email", "role", "active"]
+    },
+    "workspace_billing": {
+      "title": "Workspace Billing & Entitlements",
+      "description": "Authoritative SaaS subscription, seat limits, and entitlement state managed exclusively by server billing logic",
+      "type": "object",
+      "properties": {
+        "planId": { "type": "string", "enum": ["internal", "solo", "team"] },
+        "subscriptionStatus": { "type": "string", "enum": ["internal", "trialing", "active", "past_due", "canceled", "incomplete", "paused", "expired"] },
+        "entitlementStatus": { "type": "string", "enum": ["active", "restricted", "inactive"] },
+        "trialStartedAt": { "type": "string" },
+        "trialEndsAt": { "type": "string" },
+        "stripeCustomerId": { "type": "string" },
+        "stripeSubscriptionId": { "type": "string" },
+        "stripePriceId": { "type": "string" },
+        "seatLimit": { "type": "number" },
+        "activeSeatCount": { "type": "number" },
+        "cancelAtPeriodEnd": { "type": "boolean" },
+        "currentPeriodStart": { "type": "string" },
+        "currentPeriodEnd": { "type": "string" },
+        "billingUpdatedAt": { "type": "string" },
+        "billingSource": { "type": "string", "enum": ["internal", "stripe"] }
+      },
+      "required": ["planId", "subscriptionStatus", "entitlementStatus", "billingUpdatedAt", "billingSource"]
+    },
+    "users": {
+      "title": "User Account Profile",
+      "description": "User account profile and default workspace preference",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" },
+        "defaultWorkspaceId": { "type": "string" },
+        "onboardingStatus": { "type": "string", "enum": ["pending_workspace", "workspace_created"] }
+      },
+      "required": ["uid", "createdAt", "updatedAt"]
+    },
+    "user_workspace_memberships": {
+      "title": "User Workspace Membership Index",
+      "description": "Index mapping user UIDs to workspaces for efficient discovery without global scans",
+      "type": "object",
+      "properties": {
+        "workspaceId": { "type": "string" },
+        "role": { "type": "string", "enum": ["owner", "editor", "viewer"] },
+        "active": { "type": "boolean" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["workspaceId", "role", "active"]
     }
   },
   "firestore": {
+    "/users/{userId}": {
+      "schema": "users",
+      "description": "User account profile and onboarding state"
+    },
+    "/users/{userId}/workspaceMemberships/{workspaceId}": {
+      "schema": "user_workspace_memberships",
+      "description": "Index of workspaces that the user belongs to"
+    },
     "/workspaces/{workspaceId}": {
       "schema": "workspaces",
       "description": "Workspace root document holding metadata and legacy member arrays"
@@ -143,6 +206,10 @@
     "/workspaces/{workspaceId}/members/{memberId}": {
       "schema": "workspace_members",
       "description": "Granular user membership document for secure zero-trust RBAC"
+    },
+    "/workspaces/{workspaceId}/billing/{billingDoc}": {
+      "schema": "workspace_billing",
+      "description": "Workspace-scoped billing record (read-only for members, written strictly by authoritative server-side billing infrastructure)"
     },
     "/recipes/{recipeId}": {
       "schema": "recipes",

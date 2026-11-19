@@ -31,19 +31,110 @@ export interface SecurityContext {
  * Pure policy evaluation engine simulating Firestore Zero-Trust Rules in memory
  */
 export class PolicySimulationEngine {
-  private membersDb: Map<string, { role: 'owner' | 'editor' | 'viewer'; email: string }> = new Map();
+  private membersDb: Map<
+    string,
+    { role: 'owner' | 'editor' | 'viewer'; email: string; active?: boolean }
+  > = new Map();
   private workspacesDb: Map<string, { ownerId: string; name: string }> = new Map();
+  private usersDb: Map<string, { uid: string; email: string; ownedWorkspaceId?: string | null; trialConsumedForOwnedWorkspace?: boolean }> = new Map();
 
   constructor() {
-    // Seed initial test state
+    // Seed initial test state (all seeded members have active: true)
     this.workspacesDb.set('ws-main', { ownerId: 'uid-owner-1', name: 'Sunny Sweets Main' });
     this.workspacesDb.set('ws-bakery-b', { ownerId: 'uid-owner-2', name: 'Other Bakery' });
 
-    this.membersDb.set('ws-main/members/uid-owner-1', { role: 'owner', email: 'owner@sunnysweets.com' });
-    this.membersDb.set('ws-main/members/uid-editor-1', { role: 'editor', email: 'baker@sunnysweets.com' });
-    this.membersDb.set('ws-main/members/uid-viewer-1', { role: 'viewer', email: 'viewer@sunnysweets.com' });
+    this.membersDb.set('ws-main/members/uid-owner-1', {
+      role: 'owner',
+      email: 'owner@sunnysweets.com',
+      active: true,
+    });
+    this.membersDb.set('ws-main/members/uid-editor-1', {
+      role: 'editor',
+      email: 'baker@sunnysweets.com',
+      active: true,
+    });
+    this.membersDb.set('ws-main/members/uid-viewer-1', {
+      role: 'viewer',
+      email: 'viewer@sunnysweets.com',
+      active: true,
+    });
 
-    this.membersDb.set('ws-bakery-b/members/uid-user-b', { role: 'editor', email: 'user@otherbakery.com' });
+    this.membersDb.set('ws-bakery-b/members/uid-user-b', {
+      role: 'editor',
+      email: 'user@otherbakery.com',
+      active: true,
+    });
+
+    this.usersDb.set('uid-owner-1', { uid: 'uid-owner-1', email: 'owner@sunnysweets.com', ownedWorkspaceId: 'ws-main' });
+    this.usersDb.set('uid-owner-2', { uid: 'uid-owner-2', email: 'user@otherbakery.com', ownedWorkspaceId: 'ws-bakery-b' });
+  }
+
+  public setMember(
+    wsId: string,
+    uid: string,
+    role: 'owner' | 'editor' | 'viewer',
+    email: string,
+    active: boolean = true
+  ) {
+    this.membersDb.set(`${wsId}/members/${uid}`, { role, email, active });
+  }
+
+  public setRawMemberForTesting(
+    wsId: string,
+    uid: string,
+    record: { role?: any; email?: string; active?: any } | null
+  ) {
+    const key = `${wsId}/members/${uid}`;
+    if (record === null) {
+      this.membersDb.delete(key);
+    } else {
+      this.membersDb.set(key, record as any);
+    }
+  }
+
+  public setWorkspace(wsId: string, ownerId: string, name: string) {
+    this.workspacesDb.set(wsId, { ownerId, name });
+  }
+
+  public setUser(uid: string, profile: { uid: string; email: string; ownedWorkspaceId?: string | null; trialConsumedForOwnedWorkspace?: boolean }) {
+    this.usersDb.set(uid, profile);
+  }
+
+  private getActiveMemberRole(wsId: string | undefined, uid: string): 'owner' | 'editor' | 'viewer' | null {
+    if (!wsId) return null;
+    const rec = this.membersDb.get(`${wsId}/members/${uid}`);
+    if (!rec) return null;
+    if (rec.active !== true) return null;
+    if (rec.role !== 'owner' && rec.role !== 'editor' && rec.role !== 'viewer') return null;
+    return rec.role;
+  }
+
+  private hasUnrevokedWorkspaceOwnerFallback(wsId: string | undefined, uid: string): boolean {
+    if (!wsId) return false;
+    const ws = this.workspacesDb.get(wsId);
+    if (!ws || ws.ownerId !== uid) return false;
+    const memberRec = this.membersDb.get(`${wsId}/members/${uid}`);
+    if (!memberRec) return true;
+    return memberRec.active === true;
+  }
+
+  private isWorkspaceMember(wsId: string | undefined, uid: string): boolean {
+    return (
+      this.getActiveMemberRole(wsId, uid) !== null ||
+      this.hasUnrevokedWorkspaceOwnerFallback(wsId, uid)
+    );
+  }
+
+  private isWorkspaceOwner(wsId: string | undefined, uid: string): boolean {
+    return (
+      this.getActiveMemberRole(wsId, uid) === 'owner' ||
+      this.hasUnrevokedWorkspaceOwnerFallback(wsId, uid)
+    );
+  }
+
+  private isWorkspaceEditor(wsId: string | undefined, uid: string): boolean {
+    const role = this.getActiveMemberRole(wsId, uid);
+    return role === 'editor' || this.isWorkspaceOwner(wsId, uid);
   }
 
   public evaluateRequest(
@@ -54,7 +145,20 @@ export class PolicySimulationEngine {
     existingDocData?: any
   ): 'ALLOW' | 'DENY' {
     // Catch-all deny for unknown collections
-    const allowedCollections = ['recipes', 'presets', 'mixers', 'history', 'master_ingredients', 'settings', 'workspaces', 'members'];
+    const allowedCollections = [
+      'recipes',
+      'presets',
+      'mixers',
+      'history',
+      'master_ingredients',
+      'product_projects',
+      'settings',
+      'workspaces',
+      'members',
+      'billing',
+      'users',
+      'workspaceMemberships',
+    ];
     if (!allowedCollections.includes(collection)) {
       return 'DENY';
     }
@@ -66,6 +170,17 @@ export class PolicySimulationEngine {
 
     const uid = context.auth.uid;
 
+    // Subcollection: Billing (Phase 1.0)
+    // Client write is STRICTLY prohibited (allow write: if false)
+    // Only authorized active workspace members may read
+    if (collection === 'billing') {
+      if (operation !== 'read') {
+        return 'DENY';
+      }
+      const wsId = docData?.workspaceId || existingDocData?.workspaceId;
+      return this.isWorkspaceMember(wsId, uid) ? 'ALLOW' : 'DENY';
+    }
+
     // Collection: Settings
     if (collection === 'settings') {
       const targetUserId = docData?.userId || existingDocData?.userId;
@@ -75,35 +190,213 @@ export class PolicySimulationEngine {
       return 'DENY';
     }
 
+    // Collection: Users (Private to authenticated UID)
+    if (collection === 'users') {
+      const targetUserId = docData?.userId || docData?.uid || existingDocData?.userId || existingDocData?.uid;
+      if (targetUserId !== uid) {
+        return 'DENY';
+      }
+      if (operation === 'delete') {
+        return 'DENY'; // Rule: allow delete: if false
+      }
+      if (operation === 'update') {
+        // Authoritative anti-duplication: cannot alter or clear ownedWorkspaceId once set
+        if (existingDocData?.ownedWorkspaceId && docData?.ownedWorkspaceId !== existingDocData.ownedWorkspaceId) {
+          return 'DENY';
+        }
+        // Anti-tamper: cannot reset trialConsumedForOwnedWorkspace once set
+        if (existingDocData?.trialConsumedForOwnedWorkspace === true && docData?.trialConsumedForOwnedWorkspace !== true) {
+          return 'DENY';
+        }
+      }
+      return 'ALLOW';
+    }
+
+    // Subcollection: User Workspace Memberships Index (Private to authenticated UID)
+    if (collection === 'workspaceMemberships') {
+      const targetUserId = docData?.userId || existingDocData?.userId;
+      if (targetUserId !== uid) {
+        return 'DENY';
+      }
+      return 'ALLOW';
+    }
+
     // Collection: Workspaces
     if (collection === 'workspaces') {
-      const wsId = docData?.id || existingDocData?.id;
-      const isMember = this.membersDb.has(`${wsId}/members/${uid}`);
-      const isOwner = this.workspacesDb.get(wsId)?.ownerId === uid;
+      const wsId =
+        docData?._pathWorkspaceId ||
+        existingDocData?._pathWorkspaceId ||
+        docData?.workspaceId ||
+        existingDocData?.workspaceId ||
+        docData?.id ||
+        existingDocData?.id;
+      const isMember = this.isWorkspaceMember(wsId, uid);
+      const isOwner = this.isWorkspaceOwner(wsId, uid);
+      const isEditor = this.isWorkspaceEditor(wsId, uid);
 
       if (operation === 'read') {
-        return isMember || isOwner ? 'ALLOW' : 'DENY';
+        const isTemporaryRecoveryRead =
+          wsId === 'ws-main' &&
+          context.auth?.email === 'jaoliveras@gmail.com' &&
+          (existingDocData?.ownerEmail === 'jaoliveras@gmail.com' || docData?.ownerEmail === 'jaoliveras@gmail.com');
+        return isMember || isTemporaryRecoveryRead ? 'ALLOW' : 'DENY';
       }
-      // Create/Update/Delete workspace requires owner
+
+      if (operation === 'create') {
+        // Rule: allow create: if isSignedIn() && request.resource.data.ownerId == request.auth.uid
+        if (docData?.ownerId !== uid) {
+          return 'DENY';
+        }
+        // Authoritative duplicate workspace prevention:
+        // Must NOT already own a workspace in usersDb
+        const userRec = this.usersDb.get(uid);
+        if (userRec?.ownedWorkspaceId) {
+          return 'DENY';
+        }
+        // Anti-tamper: cannot self-grant strategic partner metadata or billing fields on creation
+        if (docData?.strategicPartner === true || docData?.billingSource) {
+          return 'DENY';
+        }
+        return 'ALLOW';
+      }
+
+      if (operation === 'update') {
+        // Calculate diff affectedKeys matching Firestore CEL rules behavior
+        const cleanDocData = { ...docData };
+        delete cleanDocData._pathWorkspaceId;
+        const cleanExistingDocData = { ...existingDocData };
+        delete cleanExistingDocData._pathWorkspaceId;
+
+        const existingKeys = Object.keys(cleanExistingDocData);
+        const requestKeys = Object.keys(cleanDocData);
+        const allKeys = Array.from(new Set([...existingKeys, ...requestKeys]));
+        const affectedKeys = allKeys.filter((k) => {
+          if (!cleanExistingDocData || !(k in cleanExistingDocData)) return true;
+          if (!cleanDocData || !(k in cleanDocData)) return true;
+          return JSON.stringify(cleanExistingDocData[k]) !== JSON.stringify(cleanDocData[k]);
+        });
+        const hasOnlyOwnerIdAndUpdatedAt =
+          affectedKeys.length > 0 &&
+          affectedKeys.every((k) => k === 'ownerId' || k === 'updatedAt');
+
+        // Temporary surgical ws-main owner rebind exception
+        const isTemporaryRebind =
+          wsId === 'ws-main' &&
+          context.auth?.email === 'jaoliveras@gmail.com' &&
+          existingDocData?.ownerId === '42JFWv9G4eb4AvUql3VrvufLeGd2' &&
+          existingDocData?.ownerEmail === 'jaoliveras@gmail.com' &&
+          docData?.ownerId === uid &&
+          docData?.ownerEmail === 'jaoliveras@gmail.com' &&
+          hasOnlyOwnerIdAndUpdatedAt &&
+          (!('id' in (existingDocData || {})) || docData?.id === existingDocData.id) &&
+          (!('name' in (existingDocData || {})) || docData?.name === existingDocData.name) &&
+          (!('code' in (existingDocData || {})) || docData?.code === existingDocData.code) &&
+          (!('businessType' in (existingDocData || {})) || docData?.businessType === existingDocData.businessType) &&
+          (!('branding' in (existingDocData || {})) || JSON.stringify(docData?.branding) === JSON.stringify(existingDocData.branding)) &&
+          (!('createdAt' in (existingDocData || {})) || docData?.createdAt === existingDocData.createdAt);
+
+        if (isOwner || isTemporaryRebind) {
+          // Normal owner update cannot alter ownerId
+          if (isOwner && !isTemporaryRebind && docData?.ownerId !== existingDocData?.ownerId) {
+            return 'DENY';
+          }
+
+          // Anti-tamper: cannot manipulate strategicPartner or billingSource
+          if (docData?.strategicPartner !== undefined && docData?.strategicPartner !== existingDocData?.strategicPartner) {
+            return 'DENY';
+          }
+          if (docData?.billingSource !== undefined && docData?.billingSource !== existingDocData?.billingSource) {
+            return 'DENY';
+          }
+          return 'ALLOW';
+        }
+
+        // Narrowly scoped Editor update ONLY for productionOptionOrder (+ optional updatedAt)
+        if (isEditor) {
+          if (docData?.ownerId !== existingDocData?.ownerId) {
+            return 'DENY';
+          }
+          if (
+            affectedKeys.length === 0 ||
+            !affectedKeys.every((k) => k === 'productionOptionOrder' || k === 'updatedAt')
+          ) {
+            return 'DENY';
+          }
+          if (!Array.isArray(docData?.productionOptionOrder) || docData.productionOptionOrder.length > 500) {
+            return 'DENY';
+          }
+          if ('updatedAt' in cleanDocData) {
+            if (typeof cleanDocData.updatedAt !== 'string' || cleanDocData.updatedAt.length > 64) {
+              return 'DENY';
+            }
+          }
+          return 'ALLOW';
+        }
+
+        return 'DENY';
+      }
+
+      // Delete workspace requires owner
       return isOwner ? 'ALLOW' : 'DENY';
     }
 
     // Subcollection: Members
     if (collection === 'members') {
       const wsId = docData?.workspaceId || existingDocData?.workspaceId;
-      const callerRole = this.membersDb.get(`${wsId}/members/${uid}`)?.role;
-      const isOwner = callerRole === 'owner' || this.workspacesDb.get(wsId)?.ownerId === uid;
+      const isExistingWorkspaceOwner = this.isWorkspaceOwner(wsId, uid);
 
       if (operation === 'read') {
-        return callerRole ? 'ALLOW' : 'DENY';
+        const isTemporaryRecoveryMemberRead =
+          wsId === 'ws-main' && context.auth?.email === 'jaoliveras@gmail.com';
+        return this.isWorkspaceMember(wsId, uid) || isTemporaryRecoveryMemberRead ? 'ALLOW' : 'DENY';
       }
-      // Member administration requires Owner role
-      return isOwner ? 'ALLOW' : 'DENY';
+
+      if (operation === 'create' || operation === 'update') {
+        // Temporary surgical ws-main member rebind exception
+        const isTemporaryMemberRebind =
+          wsId === 'ws-main' &&
+          context.auth?.email === 'jaoliveras@gmail.com' &&
+          (docData?.memberId === uid || docData?.uid === uid) &&
+          docData?.uid === uid &&
+          docData?.email === 'jaoliveras@gmail.com' &&
+          docData?.role === 'owner' &&
+          docData?.active === true;
+
+        if (isTemporaryMemberRebind) {
+          return 'ALLOW';
+        }
+
+        if (operation === 'create') {
+          // Branch 1: Existing workspace owner adding/inviting member
+          if (isExistingWorkspaceOwner) {
+            return 'ALLOW';
+          }
+          // Branch 2: Initial owner bootstrap ONLY for a newly created workspace in the current atomic batch
+          // If the workspace ALREADY exists, initial bootstrap is strictly DENIED
+          const workspaceAlreadyExists = this.workspacesDb.has(wsId);
+          if (!workspaceAlreadyExists) {
+            const isOwnerRole = docData?.role === 'owner';
+            const isActive = docData?.active === true;
+            const isSelfUid = docData?.uid === uid && (docData?.memberId === uid || !docData?.memberId);
+            if (isOwnerRole && isActive && isSelfUid) {
+              return 'ALLOW';
+            }
+          }
+          return 'DENY';
+        }
+
+        // Member update requires Owner role
+        return isExistingWorkspaceOwner ? 'ALLOW' : 'DENY';
+      }
+
+      if (operation === 'delete') {
+        return isExistingWorkspaceOwner ? 'ALLOW' : 'DENY';
+      }
     }
 
-    // Operational Collections: recipes, presets, mixers, history, master_ingredients
+    // Operational Collections: recipes, presets, mixers, history, master_ingredients, product_projects
     const targetWsId = operation === 'create' ? docData?.workspaceId : (existingDocData?.workspaceId || docData?.workspaceId);
-    
+
     // Invariant 2: Must have workspaceId
     if (!targetWsId || typeof targetWsId !== 'string' || targetWsId.trim() === '') {
       return 'DENY';
@@ -116,20 +409,36 @@ export class PolicySimulationEngine {
       }
     }
 
-    // Invariant 3: Tenant membership verification
-    const memberRecord = this.membersDb.get(`${targetWsId}/members/${uid}`);
-    if (!memberRecord) {
+    // Invariant 3: Active tenant membership verification
+    if (!this.isWorkspaceMember(targetWsId, uid)) {
       return 'DENY';
     }
 
     // Invariant 4: RBAC permissions
     if (operation === 'read') {
-      return 'ALLOW'; // Any valid member (owner, editor, viewer) can read
+      return 'ALLOW'; // Any active member (owner, editor, viewer) can read
     }
 
-    // Write operations require editor or owner
+    // Permanent recipe & preset deletion are strictly Owner-only
+    if (operation === 'delete' && (collection === 'recipes' || collection === 'presets')) {
+      return this.isWorkspaceOwner(targetWsId, uid) ? 'ALLOW' : 'DENY';
+    }
+
+    // Optional boolean field validation on presets.productionEnabled
+    if (
+      collection === 'presets' &&
+      (operation === 'create' || operation === 'update') &&
+      docData &&
+      'productionEnabled' in docData &&
+      docData.productionEnabled !== undefined &&
+      typeof docData.productionEnabled !== 'boolean'
+    ) {
+      return 'DENY';
+    }
+
+    // Operational create/update (and non-recipe/non-preset delete) require active editor or owner
     if (['create', 'update', 'delete'].includes(operation)) {
-      if (memberRecord.role === 'editor' || memberRecord.role === 'owner') {
+      if (this.isWorkspaceEditor(targetWsId, uid)) {
         return 'ALLOW';
       }
       return 'DENY'; // Viewer denied
@@ -356,6 +665,62 @@ export function runPolicySimulationTests(): SecurityTestCaseResult[] {
     details: 'Access to system_credentials collection was strictly denied.',
   });
 
+  // P13: Browser Direct Client Mutation of Billing Document (Phase 1.0 Invariant)
+  const p13 = engine.evaluateRequest(
+    { auth: { uid: 'uid-editor-1', email: 'baker@sunnysweets.com' } },
+    'update',
+    'billing',
+    { workspaceId: 'ws-main', entitlementStatus: 'active', planId: 'team' },
+    { workspaceId: 'ws-main', entitlementStatus: 'inactive', planId: 'solo' }
+  );
+  results.push({
+    id: 'P13',
+    name: 'Browser Direct Write to Billing / Entitlements (DENY)',
+    category: 'dirty_dozen',
+    expectedResult: 'DENY',
+    actualResult: p13,
+    passed: p13 === 'DENY',
+    threatMitigation: 'Authoritative billing records can only be mutated by server-side infrastructure.',
+    details: 'Browser client attempt to write to billing document was strictly denied.',
+  });
+
+  // P14: Browser Direct Self-Grant of Active Entitlement (Phase 1.0 Invariant)
+  const p14 = engine.evaluateRequest(
+    { auth: { uid: 'uid-owner-1', email: 'owner@sunnysweets.com' } },
+    'create',
+    'billing',
+    { workspaceId: 'ws-main', entitlementStatus: 'active', planId: 'team', subscriptionStatus: 'active' }
+  );
+  results.push({
+    id: 'P14',
+    name: 'Owner Self-Grant of Active Subscription via Browser (DENY)',
+    category: 'dirty_dozen',
+    expectedResult: 'DENY',
+    actualResult: p14,
+    passed: p14 === 'DENY',
+    threatMitigation: 'Prevents even workspace owners from forging active billing state from client code.',
+    details: 'Owner client attempt to create active billing record was denied.',
+  });
+
+  // P15: Non-Member Read Access to Workspace Billing (Phase 1.0 Invariant)
+  const p15 = engine.evaluateRequest(
+    { auth: { uid: 'uid-stranger', email: 'stranger@external.com' } },
+    'read',
+    'billing',
+    undefined,
+    { workspaceId: 'ws-main', planId: 'team' }
+  );
+  results.push({
+    id: 'P15',
+    name: 'Non-Member Read of Workspace Billing Data (DENY)',
+    category: 'dirty_dozen',
+    expectedResult: 'DENY',
+    actualResult: p15,
+    passed: p15 === 'DENY',
+    threatMitigation: 'Ensures private workspace subscription and seat limits are shielded from external users.',
+    details: 'Non-member read of ws-main billing document was denied.',
+  });
+
   // Valid Access Test Cases (Sanity Checks)
   const v01 = engine.evaluateRequest(
     { auth: { uid: 'uid-owner-1', email: 'owner@sunnysweets.com' } },
@@ -407,6 +772,24 @@ export function runPolicySimulationTests(): SecurityTestCaseResult[] {
     passed: v03 === 'ALLOW',
     threatMitigation: 'Verified viewers can access recipe viewing and production scaling without write risks.',
     details: 'Viewer successfully authorized to read workspace recipes.',
+  });
+
+  const v04 = engine.evaluateRequest(
+    { auth: { uid: 'uid-editor-1', email: 'baker@sunnysweets.com' } },
+    'read',
+    'billing',
+    undefined,
+    { workspaceId: 'ws-main', planId: 'team' }
+  );
+  results.push({
+    id: 'V04',
+    name: 'Workspace Member Billing Read Authorization',
+    category: 'valid_access',
+    expectedResult: 'ALLOW',
+    actualResult: v04,
+    passed: v04 === 'ALLOW',
+    threatMitigation: 'Verified authorized workspace members can read their workspace subscription state.',
+    details: 'Editor authorized to read ws-main billing document.',
   });
 
   return results;

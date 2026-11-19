@@ -45,8 +45,24 @@
 .border-brand-border { border-color: var(--color-border); }
 
 @layer base {
+  html,
   body {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
     font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  }
+  #root {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
+  }
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
   }
   h1, h2, .font-serif {
     font-family: 'Playfair Display', Georgia, serif;

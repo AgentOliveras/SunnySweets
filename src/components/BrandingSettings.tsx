@@ -27,6 +27,7 @@ import {
   DEFAULT_DISPLAY_NAME,
 } from '../utils/branding';
 import { uploadWorkspaceLogoToStorage } from '../services/firebase';
+import { supportsBranding, getPlanDefinition } from '../types/billing';
 
 interface BrandingSettingsProps {
   onSuccessNotice?: (msg: string) => void;
@@ -36,6 +37,10 @@ export const BrandingSettings: React.FC<BrandingSettingsProps> = ({ onSuccessNot
   const activeWorkspace = store.getActiveWorkspace();
   const [userRole, setUserRole] = useState<AccessRole | null>(() => store.getUserRole());
   const isOwner = userRole === 'owner';
+
+  const [evaluation, setEvaluation] = useState(() => store.getEntitlementEvaluation());
+  const canCustomizeBranding = isOwner && supportsBranding(evaluation.planId);
+  const planDef = getPlanDefinition(evaluation.planId);
 
   const [savedBranding, setSavedBranding] = useState<WorkspaceBranding>(() => {
     try {
@@ -80,6 +85,7 @@ export const BrandingSettings: React.FC<BrandingSettingsProps> = ({ onSuccessNot
   useEffect(() => {
     const unsub = store.subscribe(() => {
       setUserRole(store.getUserRole());
+      setEvaluation(store.getEntitlementEvaluation());
       try {
         const current = store.getWorkspaceBranding();
         if (current) {
@@ -111,13 +117,13 @@ export const BrandingSettings: React.FC<BrandingSettingsProps> = ({ onSuccessNot
   }, []);
 
   const handlePaletteSelect = (newPaletteId: string) => {
-    if (!isOwner) return;
+    if (!canCustomizeBranding) return;
     setPaletteId(newPaletteId);
     setFeedback(null);
   };
 
   const handleLogoFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (!isOwner) return;
+    if (!canCustomizeBranding) return;
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -135,7 +141,7 @@ export const BrandingSettings: React.FC<BrandingSettingsProps> = ({ onSuccessNot
   };
 
   const handleRemoveLogo = () => {
-    if (!isOwner) return;
+    if (!canCustomizeBranding) return;
     setPendingLogoFile(null);
     setLocalPreviewUrl(null);
     setLogoUrl(undefined);
@@ -158,7 +164,7 @@ export const BrandingSettings: React.FC<BrandingSettingsProps> = ({ onSuccessNot
 
   const handleSaveBranding = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (!isOwner) return;
+    if (!canCustomizeBranding) return;
 
     const nameValidation = sanitizeDisplayName(displayName);
     if (!nameValidation.valid) {
@@ -233,7 +239,7 @@ export const BrandingSettings: React.FC<BrandingSettingsProps> = ({ onSuccessNot
   };
 
   const handleRestoreDefault = async () => {
-    if (!isOwner) return;
+    if (!canCustomizeBranding) return;
     const confirmReset = window.confirm(
       'Restore workspace defaults? This will reset the color palette to Warm Bakery, use the workspace default name, and remove any custom logo.'
     );
@@ -311,6 +317,26 @@ export const BrandingSettings: React.FC<BrandingSettingsProps> = ({ onSuccessNot
         </div>
       )}
 
+      {/* Plan Notice: Solo Plan Feature Gate */}
+      {isOwner && !supportsBranding(evaluation.planId) && (
+        <div
+          id="solo-plan-branding-gate-banner"
+          className="p-4 rounded-xl bg-amber-50/90 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900/50 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-amber-900 dark:text-amber-200"
+        >
+          <div className="flex items-start gap-3">
+            <Palette className="w-5 h-5 shrink-0 text-amber-600 dark:text-amber-400 mt-0.5" />
+            <div>
+              <h4 className="font-bold text-sm text-[#5A534B] dark:text-[#EAE6E1]">
+                Custom Branding is a Team Plan Feature
+              </h4>
+              <p className="text-xs text-[#8B7E74] dark:text-[#A39E93] mt-0.5 leading-relaxed">
+                Workspaces on the Solo plan use standard Warm Bakery theme defaults. Upgrade to the Team plan to upload a custom bakery logo, choose curated artisanal color palettes, and personalize your bakery storefront display name.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Feedback Alert */}
       {feedback && (
         <div
@@ -354,7 +380,7 @@ export const BrandingSettings: React.FC<BrandingSettingsProps> = ({ onSuccessNot
             <input
               id="workspace-branding-display-name-input"
               type="text"
-              disabled={!isOwner || isSaving}
+              disabled={!canCustomizeBranding || isSaving}
               value={displayName}
               maxLength={60}
               onChange={(e) => {
@@ -419,7 +445,7 @@ export const BrandingSettings: React.FC<BrandingSettingsProps> = ({ onSuccessNot
             </div>
 
             {/* Upload Controls */}
-            {isOwner && (
+            {canCustomizeBranding && (
               <div className="space-y-3">
                 <input
                   type="file"
@@ -725,7 +751,7 @@ export const BrandingSettings: React.FC<BrandingSettingsProps> = ({ onSuccessNot
         </div>
 
         {/* 5. ACTION BUTTONS (Save / Discard / Restore Default) */}
-        {isOwner && (
+        {canCustomizeBranding && (
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-3 border-t border-[#E5E1DA] dark:border-[#2D2925]">
             <button
               type="button"

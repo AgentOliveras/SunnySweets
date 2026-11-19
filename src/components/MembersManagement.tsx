@@ -22,6 +22,7 @@ import {
 import { store } from '../services/store';
 import { auth } from '../services/firebase';
 import { WorkspaceMemberDoc, AccessRole } from '../types';
+import { canManageTeam, computeSeatUsage } from '../types/billing';
 
 interface MembersManagementProps {
   onSuccessNotice?: (message: string) => void;
@@ -186,6 +187,24 @@ export const MembersManagement: React.FC<MembersManagementProps> = ({ onSuccessN
       return;
     }
 
+    // Phase 1.3 Plan Capability & Seat Enforcement Check
+    const evaluation = store.getEntitlementEvaluation();
+    if (!canManageTeam(evaluation.planId)) {
+      setAddError(
+        'Team member management is not included in the Solo plan. Upgrade to the Team plan to invite additional editors and viewers.'
+      );
+      return;
+    }
+
+    const activeMembersCount = store.getComputedActiveSeatCount();
+    const seatUsage = computeSeatUsage(evaluation.planId, activeMembersCount);
+    if (!seatUsage.canAddMember) {
+      setAddError(
+        `Workspace seat limit reached (${seatUsage.activeSeats}/${seatUsage.seatLimit} seats occupied on ${seatUsage.planDisplayName} plan). Upgrade your bakery subscription plan in Settings to invite additional team members.`
+      );
+      return;
+    }
+
     try {
       setIsSubmittingAdd(true);
       await store.addWorkspaceMember({
@@ -212,7 +231,7 @@ export const MembersManagement: React.FC<MembersManagementProps> = ({ onSuccessN
     setEditingMember(member);
     setEditName(member.name);
     setEditRole(member.role === 'viewer' ? 'viewer' : 'editor');
-    setEditActive(member.active !== false);
+    setEditActive(member.active === true);
     setEditError(null);
   };
 
@@ -352,6 +371,29 @@ export const MembersManagement: React.FC<MembersManagementProps> = ({ onSuccessN
             )}
           </div>
 
+          {/* Plan & Seat Usage Badge */}
+          {(() => {
+            const evalResult = store.getEntitlementEvaluation();
+            const activeCount = store.getComputedActiveSeatCount();
+            const seatUsage = computeSeatUsage(evalResult.planId, activeCount);
+            return (
+              <div
+                id="workspace-seat-usage-badge"
+                className={`hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border ${
+                  seatUsage.isAtLimit
+                    ? 'bg-amber-50 dark:bg-amber-950/30 border-amber-300 dark:border-amber-800 text-amber-900 dark:text-amber-200'
+                    : 'bg-[#FAF8F5] dark:bg-[#25221F] border-[#E5E1DA] dark:border-[#332F2B] text-[#5A534B] dark:text-[#D1CBC5]'
+                }`}
+              >
+                <span className="text-[#8B7E74] dark:text-[#A39E93]">Plan:</span>
+                <span className="font-semibold text-[#D4A373]">{seatUsage.planDisplayName}</span>
+                <span className="text-[11px] text-[#8B7E74] dark:text-[#A39E93]">
+                  ({seatUsage.activeSeats}/{seatUsage.isUnlimited ? '∞' : seatUsage.seatLimit} active seats)
+                </span>
+              </div>
+            );
+          })()}
+
           {/* Refresh Roster Button */}
           <button
             type="button"
@@ -363,10 +405,11 @@ export const MembersManagement: React.FC<MembersManagementProps> = ({ onSuccessN
             <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin text-[#D4A373]' : ''}`} />
           </button>
 
-          {/* Add Member Button (Owner only) */}
-          {isOwner && (
+          {/* Add Member Button (Owner only, on Team or Internal plans) */}
+          {isOwner && canManageTeam(store.getEntitlementEvaluation().planId) && (
             <button
               type="button"
+              id="btn-add-workspace-member"
               onClick={handleOpenAdd}
               className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-[#D4A373] hover:bg-[#C49363] text-white text-xs font-bold rounded-lg shadow-sm transition cursor-pointer"
             >
@@ -376,6 +419,26 @@ export const MembersManagement: React.FC<MembersManagementProps> = ({ onSuccessN
           )}
         </div>
       </div>
+
+      {/* Solo Plan Team Management Upsell Banner */}
+      {isOwner && !canManageTeam(store.getEntitlementEvaluation().planId) && (
+        <div
+          id="solo-plan-team-upsell-banner"
+          className="p-4 rounded-xl bg-amber-50/90 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900/50 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-amber-900 dark:text-amber-200"
+        >
+          <div className="flex items-start gap-3">
+            <Users className="w-5 h-5 shrink-0 text-amber-600 dark:text-amber-400 mt-0.5" />
+            <div>
+              <h4 className="font-bold text-sm text-[#5A534B] dark:text-[#EAE6E1]">
+                Single-User Solo Workspace (1 Seat)
+              </h4>
+              <p className="text-xs text-[#8B7E74] dark:text-[#A39E93] mt-0.5">
+                The Solo plan is designed for individual artisan bakers and single-chef kitchens. Upgrade to the Team plan to collaborate with editors, assistants, and viewers with up to 5 seats.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Visible Error Panel for Member Data Failure */}
       {fetchError && (

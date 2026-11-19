@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   Calculator,
   Plus,
@@ -15,8 +15,10 @@ import {
   Sliders,
   Printer,
   ChevronDown,
+  RefreshCw,
 } from 'lucide-react';
 import {
+  AccessRole,
   Recipe,
   ProductionPreset,
   Mixer,
@@ -25,8 +27,19 @@ import {
   UserSettings,
   WeightUnit,
   ProductionHistoryEntry,
+  MasterIngredient,
+  ProductionMeasurementDisplayMode,
 } from '../types';
-import { calculateProduction, calculateRecipeTotal } from '../utils/calculator';
+import {
+  calculateProduction,
+  calculateRecipeTotal,
+  getApplicablePresetsForRecipe,
+  normalizePresetCategory,
+  resolveEffectiveWastePercent,
+  isValidWastePercent,
+} from '../utils/calculator';
+import { getTargetPresetCategoriesForRecipeCategory } from '../utils/categoryPresetMapping';
+import { isPresetEnabledForProduction } from '../utils/productionOptionOrdering';
 import {
   formatNumber,
   WEIGHT_UNITS,
@@ -35,18 +48,45 @@ import {
   isButterIngredient,
   isPeanutButterIngredient,
   getDisplayDecimals,
+  PRODUCTION_DISPLAY_MODES,
+  isWeightUnit,
 } from '../utils/units';
 import { exportProductionSheetPDF } from '../utils/pdfExport';
 import { store } from '../services/store';
+import { calculateRecipeCostSummary, calculateScaledProductionCost } from '../utils/costing';
+import {
+  resolveApplicableSafetyInstructions,
+  isSafetySignatureAcknowledged,
+  canProceedToMix,
+  canProceedToMixWithSyncSafety,
+  FirestoreHydrationState,
+  resolveSafetyOperationalGateState,
+  resolveSafetySyncStatusLabel,
+  SAFETY_HYDRATION_LOADING_MESSAGE,
+  SAFETY_HYDRATION_ERROR_MESSAGE,
+  SAFETY_CONNECTION_UNVERIFIED_MESSAGE,
+} from '../utils/productionNotes';
 
 interface ProductionCalculatorProps {
   recipes: Recipe[];
   presets: ProductionPreset[];
   mixers: Mixer[];
   settings: UserSettings;
+  userRole?: AccessRole | null;
+  categoryPresetMap?: Record<string, string | string[]>;
   initialRecipeId?: string;
+  initialCalculation?: CalculationResult | null;
+  recipesHydrationState?: FirestoreHydrationState;
+  presetsHydrationState?: FirestoreHydrationState;
+  criticalNotesSyncError?: string | null;
+  connectionVerified?: boolean;
+  isReconnecting?: boolean;
+  activeWorkspaceId?: string;
   onStartGuidedMixing: (calc: CalculationResult) => void;
-  onSaveToHistory: (entry: ProductionHistoryEntry) => void;
+  onSaveToHistory: (entry: ProductionHistoryEntry) => Promise<void> | void;
+  masterIngredients?: MasterIngredient[];
+  initialAcknowledgedSignatureForTest?: string | null;
+  initialCheckedIngredientsForTest?: Record<string, boolean>;
 }
 
 export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
@@ -54,10 +94,24 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
   presets,
   mixers,
   settings,
+  userRole,
+  categoryPresetMap,
   initialRecipeId,
+  initialCalculation = null,
+  recipesHydrationState,
+  presetsHydrationState,
+  criticalNotesSyncError,
+  connectionVerified,
+  isReconnecting,
+  activeWorkspaceId,
   onStartGuidedMixing,
   onSaveToHistory,
+  masterIngredients,
+  initialAcknowledgedSignatureForTest,
+  initialCheckedIngredientsForTest,
 }) => {
+  const effectiveRole = userRole !== undefined ? userRole : (store.getUserRole() ?? 'owner');
+  const canSaveHistory = effectiveRole === 'owner' || effectiveRole === 'editor';
   const [selectedRecipeId, setSelectedRecipeId] = useState<string>(
     initialRecipeId || (recipes.length > 0 ? recipes[0].id : '')
   );
@@ -65,10 +119,19 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
   useEffect(() => {
     if (initialRecipeId) {
       setSelectedRecipeId(initialRecipeId);
+      setWasteOverride(''); // Rule 8: Switching recipes clears temporary calculation override
     }
   }, [initialRecipeId]);
 
   const selectedRecipe = recipes.find((r) => r.id === selectedRecipeId);
+
+  // Authoritative effective default waste percentage for selected recipe (recipe-specific with bakery-wide fallback)
+  const effectiveRecipeWaste = React.useMemo(() => {
+    return resolveEffectiveWastePercent({
+      recipeWastePercent: selectedRecipe?.defaultWastePercent,
+      settingsWastePercent: settings.defaultWastePercent,
+    });
+  }, [selectedRecipe?.defaultWastePercent, settings.defaultWastePercent]);
 
   // Requirements list (multiple presets or custom items in 1 calculation)
   const [requirements, setRequirements] = useState<ProductionItemRequirement[]>([
@@ -83,10 +146,8 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
     },
   ]);
 
-  // Waste override (temporary calculation waste %) - defaults to 6%
-  const [wasteOverride, setWasteOverride] = useState<string>(
-    settings.defaultWastePercent !== undefined ? String(settings.defaultWastePercent) : '6'
-  );
+  // Waste override (temporary calculation waste %) - blank by default (uses recipe default unless explicitly overridden)
+  const [wasteOverride, setWasteOverride] = useState<string>('');
 
   // Selected Mixer
   const [selectedMixerId, setSelectedMixerId] = useState<string>(
@@ -97,22 +158,34 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
   // Display Unit Toggle
   const [displayUnit, setDisplayUnit] = useState<WeightUnit>(settings.defaultWeightUnit || 'lb');
 
-  // Active preset routing categories for the currently selected recipe
-  const mappedPresetCategories = React.useMemo<string[]>(() => {
-    if (!selectedRecipe || !selectedRecipe.category) return ['All'];
-    const mapVal = settings.categoryPresetMap && settings.categoryPresetMap[selectedRecipe.category];
-    if (!mapVal) return ['All'];
-    if (Array.isArray(mapVal)) {
-      return mapVal.length === 0 ? ['All'] : mapVal;
-    }
-    return [mapVal];
-  }, [selectedRecipe, settings.categoryPresetMap]);
+  // Display Mode (Phase 2B.5.5)
+  const [displayMode, setDisplayMode] = useState<ProductionMeasurementDisplayMode>(
+    settings.defaultProductionDisplayMode || 'as_entered'
+  );
 
-  // Group presets by category for organized selection, prioritizing mapped categories
+  // Authoritative shared workspace category mapping (identical to Production Floor Mode)
+  const effectiveCategoryPresetMap = React.useMemo(() => {
+    return categoryPresetMap ?? store.getCategoryPresetMap();
+  }, [categoryPresetMap]);
+
+  // Active preset routing categories for the currently selected recipe (no automatic 'All' fallback for unmapped categories)
+  const mappedPresetCategories = React.useMemo<string[]>(() => {
+    return getTargetPresetCategoriesForRecipeCategory(
+      selectedRecipe?.category,
+      effectiveCategoryPresetMap
+    );
+  }, [selectedRecipe, effectiveCategoryPresetMap]);
+
+  // Applicable presets filtered via the exact same logic used in Production Floor Mode
+  const applicablePresets = React.useMemo(() => {
+    return getApplicablePresetsForRecipe(selectedRecipe, presets, effectiveCategoryPresetMap);
+  }, [selectedRecipe, presets, effectiveCategoryPresetMap]);
+
+  // Group applicable presets by normalized category for organized selection
   const groupedPresets = React.useMemo(() => {
     const groups: Record<string, ProductionPreset[]> = {};
-    presets.forEach((p) => {
-      const cat = p.category || 'Cookies';
+    applicablePresets.forEach((p) => {
+      const cat = normalizePresetCategory(p);
       if (!groups[cat]) groups[cat] = [];
       groups[cat].push(p);
     });
@@ -120,11 +193,11 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
     const isAll = mappedPresetCategories.includes('All');
     if (isAll) return groups;
 
-    // Place all mapped categories at the front of categories
     const sortedGroups: Record<string, ProductionPreset[]> = {};
     mappedPresetCategories.forEach((cat) => {
-      if (groups[cat]) {
-        sortedGroups[cat] = groups[cat];
+      const matchingKey = Object.keys(groups).find((k) => k.toLowerCase() === cat.toLowerCase());
+      if (matchingKey && groups[matchingKey]) {
+        sortedGroups[matchingKey] = groups[matchingKey];
       }
     });
     Object.keys(groups).forEach((key) => {
@@ -133,19 +206,12 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
       }
     });
     return sortedGroups;
-  }, [presets, mappedPresetCategories]);
+  }, [applicablePresets, mappedPresetCategories]);
 
-  // Update requirement preset when recipe changes if default empty
+  // Update requirement preset when recipe or applicable presets change if default empty
   useEffect(() => {
     if (requirements.length === 1 && (!requirements[0].quantity || requirements[0].quantity === ('' as any))) {
-      let targetPreset = presets[0] || null;
-      const isAll = mappedPresetCategories.includes('All');
-      if (!isAll && mappedPresetCategories.length > 0) {
-        const found = presets.find((p) =>
-          mappedPresetCategories.some((mc) => mc.toLowerCase() === (p.category || 'Cookies').toLowerCase())
-        );
-        if (found) targetPreset = found;
-      }
+      const targetPreset = applicablePresets[0] || null;
       if (targetPreset) {
         setRequirements([
           {
@@ -158,39 +224,264 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
             itemWeightUnit: targetPreset.weightUnit,
           },
         ]);
+      } else {
+        setRequirements([
+          {
+            id: `req-1`,
+            presetId: undefined,
+            presetName: 'Custom Item',
+            quantity: '' as any,
+            piecesPerUnit: 100,
+            itemWeight: 2,
+            itemWeightUnit: 'oz',
+          },
+        ]);
       }
     }
-  }, [selectedRecipeId, mappedPresetCategories]);
+  }, [selectedRecipeId, applicablePresets]);
 
   // Capacity Warning Override State
   const [capacityOverridden, setCapacityOverridden] = useState(false);
   const [showCapacityModal, setShowCapacityModal] = useState(false);
 
   // Checked ingredients state for checking off during production
-  const [checkedIngredients, setCheckedIngredients] = useState<Record<string, boolean>>({});
+  const [checkedIngredients, setCheckedIngredients] = useState<Record<string, boolean>>(
+    () => initialCheckedIngredientsForTest ?? {}
+  );
 
   // Calculation Result
-  const [calculationResult, setCalculationResult] = useState<CalculationResult | null>(null);
+  const [calculationResult, setCalculationResult] = useState<CalculationResult | null>(
+    initialCalculation
+  );
 
-  // Synchronize display unit and default waste when business settings change
+  // Safety Hydration & Critical Production Notes acknowledgment state
+  const [acknowledgedSafetySignature, setAcknowledgedSafetySignature] = useState<string | null>(
+    () => initialAcknowledgedSignatureForTest ?? null
+  );
+  const [wasInvalidatedByLiveUpdate, setWasInvalidatedByLiveUpdate] = useState<boolean>(false);
+  const [historySaveMessage, setHistorySaveMessage] = useState<{
+    status: 'saved' | 'error';
+    text: string;
+  } | null>(null);
+
+  const [storeSyncError, setStoreSyncError] = useState<string | null>(() =>
+    store.getCriticalNotesSyncError()
+  );
+  const [storeRecipesHydrationState, setStoreRecipesHydrationState] =
+    useState<FirestoreHydrationState>(() => store.getRecipesHydrationState());
+  const [storePresetsHydrationState, setStorePresetsHydrationState] =
+    useState<FirestoreHydrationState>(() => store.getPresetsHydrationState());
+  const [storeConnectionVerified, setStoreConnectionVerified] = useState<boolean>(() =>
+    store.isSafetyConnectionVerified()
+  );
+  const [storeIsReconnecting, setStoreIsReconnecting] = useState<boolean>(() =>
+    store.isSafetyReconnectingState()
+  );
+  const [storeIsAuthorized, setStoreIsAuthorized] = useState<boolean>(() =>
+    store.isAuthorized()
+  );
+
+  useEffect(() => {
+    const unsub = store.subscribe(() => {
+      setStoreSyncError(store.getCriticalNotesSyncError());
+      setStoreRecipesHydrationState(store.getRecipesHydrationState());
+      setStorePresetsHydrationState(store.getPresetsHydrationState());
+      setStoreConnectionVerified(store.isSafetyConnectionVerified());
+      setStoreIsReconnecting(store.isSafetyReconnectingState());
+      setStoreIsAuthorized(store.isAuthorized());
+    });
+    return unsub;
+  }, []);
+
+  const effectiveWorkspaceId = activeWorkspaceId || store.getActiveWorkspaceId();
+  const effectiveSyncError =
+    criticalNotesSyncError !== undefined ? criticalNotesSyncError : storeSyncError;
+  const effectiveRecipesHydrationState =
+    recipesHydrationState !== undefined ? recipesHydrationState : storeRecipesHydrationState;
+  const effectivePresetsHydrationState =
+    presetsHydrationState !== undefined ? presetsHydrationState : storePresetsHydrationState;
+  const effectiveConnectionVerified =
+    connectionVerified !== undefined ? connectionVerified : storeConnectionVerified;
+  const effectiveIsReconnecting =
+    isReconnecting !== undefined ? isReconnecting : storeIsReconnecting;
+
+  const operationalGateState = useMemo(
+    () =>
+      resolveSafetyOperationalGateState({
+        recipesHydrationState: effectiveRecipesHydrationState,
+        presetsHydrationState: effectivePresetsHydrationState,
+        syncError: effectiveSyncError,
+        connectionVerified: effectiveConnectionVerified,
+      }),
+    [
+      effectiveRecipesHydrationState,
+      effectivePresetsHydrationState,
+      effectiveSyncError,
+      effectiveConnectionVerified,
+    ]
+  );
+
+  const syncStatusLabel = useMemo(
+    () =>
+      resolveSafetySyncStatusLabel({
+        operationalState: operationalGateState,
+        isReconnecting: effectiveIsReconnecting,
+      }),
+    [operationalGateState, effectiveIsReconnecting]
+  );
+
+  const activeRecipeForSafety = useMemo(() => {
+    if (calculationResult?.recipe) {
+      return recipes.find((r) => r.id === calculationResult.recipe.id) || calculationResult.recipe;
+    }
+    return selectedRecipe || null;
+  }, [calculationResult?.recipe, recipes, selectedRecipe]);
+
+  const selectedPresetIdsForSafety = useMemo(() => {
+    const ids = new Set<string>();
+    requirements.forEach((req) => {
+      if (req.presetId && req.presetId.trim()) ids.add(req.presetId.trim());
+    });
+    calculationResult?.requirements?.forEach((req) => {
+      if (req.presetId && req.presetId.trim()) ids.add(req.presetId.trim());
+    });
+    return Array.from(ids);
+  }, [requirements, calculationResult?.requirements]);
+
+  const safetyResolution = useMemo(
+    () =>
+      resolveApplicableSafetyInstructions({
+        recipe: activeRecipeForSafety,
+        presets,
+        selectedPresetIds: selectedPresetIdsForSafety,
+        activeWorkspaceId: effectiveWorkspaceId,
+      }),
+    [activeRecipeForSafety, presets, selectedPresetIdsForSafety, effectiveWorkspaceId]
+  );
+
+  const hasSafetyNotes = safetyResolution.hasSafetyNotes;
+  const isNotesAcknowledged = useMemo(
+    () => isSafetySignatureAcknowledged(safetyResolution.signature, acknowledgedSafetySignature),
+    [safetyResolution.signature, acknowledgedSafetySignature]
+  );
+
+  const canProceedWithMix = useMemo(
+    () =>
+      canProceedToMixWithSyncSafety({
+        hasNotes: hasSafetyNotes,
+        isAcknowledged: isNotesAcknowledged,
+        syncError: effectiveSyncError,
+        recipesHydrationState: effectiveRecipesHydrationState,
+        presetsHydrationState: effectivePresetsHydrationState,
+        connectionVerified: effectiveConnectionVerified,
+      }),
+    [
+      hasSafetyNotes,
+      isNotesAcknowledged,
+      effectiveSyncError,
+      effectiveRecipesHydrationState,
+      effectivePresetsHydrationState,
+      effectiveConnectionVerified,
+    ]
+  );
+
+  // Operational checklist visibility: gated behind safety approval on initial view,
+  // and preserved in read-only hold if Wi-Fi drops (CONNECTION_UNVERIFIED) after approval.
+  const canShowOperationalChecklist = useMemo(
+    () =>
+      canProceedWithMix ||
+      (operationalGateState === 'CONNECTION_UNVERIFIED' &&
+        canProceedToMix(hasSafetyNotes, isNotesAcknowledged)),
+    [canProceedWithMix, operationalGateState, hasSafetyNotes, isNotesAcknowledged]
+  );
+
+  const prevCalcContextRef = React.useRef<string>(`${selectedRecipeId}::${effectiveWorkspaceId}`);
+  useEffect(() => {
+    const nextKey = `${selectedRecipeId}::${effectiveWorkspaceId}`;
+    if (prevCalcContextRef.current !== nextKey || !storeIsAuthorized) {
+      prevCalcContextRef.current = nextKey;
+      setAcknowledgedSafetySignature(null);
+      setWasInvalidatedByLiveUpdate(false);
+      setHistorySaveMessage(null);
+    }
+  }, [selectedRecipeId, effectiveWorkspaceId, storeIsAuthorized]);
+
+  useEffect(() => {
+    if (
+      operationalGateState === 'READY' &&
+      hasSafetyNotes &&
+      !isNotesAcknowledged &&
+      acknowledgedSafetySignature &&
+      acknowledgedSafetySignature !== safetyResolution.signature
+    ) {
+      setWasInvalidatedByLiveUpdate(true);
+    }
+  }, [
+    operationalGateState,
+    hasSafetyNotes,
+    isNotesAcknowledged,
+    acknowledgedSafetySignature,
+    safetyResolution.signature,
+  ]);
+
+  const handleAcknowledgeSafetyNotes = () => {
+    if (operationalGateState !== 'READY' || !safetyResolution.signature) return;
+    setAcknowledgedSafetySignature(safetyResolution.signature);
+    setWasInvalidatedByLiveUpdate(false);
+  };
+
+  const handleRetrySafetySync = () => {
+    void store.retrySafetySync();
+  };
+
+  // Scaled Recipe Cost Summary (Read-Only Informational Display)
+  const [showCostDetails, setShowCostDetails] = useState(false);
+
+  const effectiveMasterIngredients = masterIngredients || store.getMasterIngredients();
+
+  const recipeCostSummary = useMemo(() => {
+    if (!calculationResult?.recipe) return null;
+    return calculateRecipeCostSummary(calculationResult.recipe, effectiveMasterIngredients);
+  }, [calculationResult?.recipe, effectiveMasterIngredients]);
+
+  const scaledCostResult = useMemo(() => {
+    if (!recipeCostSummary || !calculationResult) return null;
+    return calculateScaledProductionCost(recipeCostSummary, calculationResult.scalingMultiplier);
+  }, [recipeCostSummary, calculationResult?.scalingMultiplier]);
+
+  const getHumanReadableReason = (reason?: string): string => {
+    switch (reason) {
+      case 'UNLINKED':
+        return 'Link this recipe ingredient to a Pantry item.';
+      case 'NO_PURCHASE_PRICE':
+        return 'Purchase cost has not been entered.';
+      case 'MISSING_DENSITY':
+        return 'Density is required to cost this volume ingredient.';
+      case 'MISSING_PIECE_WEIGHT':
+        return 'Piece weight is required for this count ingredient.';
+      case 'MASTER_INGREDIENT_NOT_FOUND':
+        return 'The linked Pantry item is unavailable.';
+      case 'UNSUPPORTED_UNIT':
+        return 'This unit cannot currently be costed.';
+      default:
+        return 'Cost information incomplete.';
+    }
+  };
+
+  // Synchronize display unit when business settings change
   useEffect(() => {
     if (settings.defaultWeightUnit) {
       setDisplayUnit(settings.defaultWeightUnit);
     }
   }, [settings.defaultWeightUnit]);
 
-  useEffect(() => {
-    if (settings.defaultWastePercent !== undefined) {
-      setWasteOverride(String(settings.defaultWastePercent));
-    }
-  }, [settings.defaultWastePercent]);
-
   // Perform Calculation function
   const handleCalculate = (
     forceOverride = false,
     customWasteOverride?: string,
     customMixerId?: string,
-    customUnit?: WeightUnit
+    customUnit?: WeightUnit,
+    customDisplayMode?: ProductionMeasurementDisplayMode
   ) => {
     if (!selectedRecipe) {
       alert('Please select a recipe.');
@@ -205,7 +496,7 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
     // Batch Calculation will not generate if there is an empty space in quantity (units)
     const hasEmptyQuantity = requirements.some(
       (r) =>
-        r.quantity === '' ||
+        (r.quantity as unknown as string) === '' ||
         r.quantity === undefined ||
         r.quantity === null ||
         isNaN(Number(r.quantity)) ||
@@ -220,16 +511,18 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
     setCheckedIngredients({});
 
     const wasteStr = customWasteOverride !== undefined ? customWasteOverride : wasteOverride;
-    const overrideVal = wasteStr !== '' ? parseFloat(wasteStr) : undefined;
+    const overrideVal = isValidWastePercent(wasteStr) ? parseFloat(wasteStr) : undefined;
     const mixerIdToUse = customMixerId !== undefined ? customMixerId : selectedMixerId;
     const mixerToUse = mixers.find((m) => m.id === mixerIdToUse);
     const unitToUse = customUnit || displayUnit;
+    const modeToUse = customDisplayMode || displayMode;
 
     const res = calculateProduction(selectedRecipe, requirements, {
       overrideWastePercent: overrideVal,
       defaultWastePercent: settings.defaultWastePercent,
       mixer: mixerToUse,
       defaultWeightUnit: unitToUse,
+      displayMode: modeToUse,
       capacityOverridden: forceOverride || capacityOverridden,
     });
 
@@ -250,7 +543,7 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
 
     const hasInvalidQuantity = requirements.some(
       (r) =>
-        r.quantity === '' ||
+        (r.quantity as unknown as string) === '' ||
         r.quantity === undefined ||
         r.quantity === null ||
         isNaN(Number(r.quantity)) ||
@@ -258,12 +551,13 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
     );
     if (hasInvalidQuantity || requirements.length === 0) return;
 
-    const overrideVal = newWasteStr !== '' ? parseFloat(newWasteStr) : undefined;
+    const overrideVal = isValidWastePercent(newWasteStr) ? parseFloat(newWasteStr) : undefined;
     const res = calculateProduction(selectedRecipe, requirements, {
       overrideWastePercent: overrideVal,
       defaultWastePercent: settings.defaultWastePercent,
       mixer: selectedMixer,
       defaultWeightUnit: displayUnit,
+      displayMode,
       capacityOverridden: capacityOverridden,
     });
     setCalculationResult(res);
@@ -271,14 +565,7 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
 
   // Add requirement item
   const handleAddRequirement = () => {
-    let firstPreset = presets.length > 0 ? presets[0] : null;
-    const isAll = mappedPresetCategories.includes('All');
-    if (!isAll && mappedPresetCategories.length > 0) {
-      const found = presets.find((p) =>
-        mappedPresetCategories.some((mc) => mc.toLowerCase() === (p.category || 'Cookies').toLowerCase())
-      );
-      if (found) firstPreset = found;
-    }
+    const firstPreset = applicablePresets.length > 0 ? applicablePresets[0] : null;
     const newReq: ProductionItemRequirement = {
       id: `req-${Date.now()}`,
       presetId: firstPreset ? firstPreset.id : undefined,
@@ -316,8 +603,8 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
 
   const decimals = settings.decimalPlaces !== undefined ? settings.decimalPlaces : 2;
 
-  const handleSaveToHistoryClick = () => {
-    if (!calculationResult) return;
+  const handleSaveToHistoryClick = async () => {
+    if (!canSaveHistory || !calculationResult || !canProceedWithMix) return;
     const historyEntry: ProductionHistoryEntry = {
       id: `hist-${Date.now()}`,
       userId: '',
@@ -341,22 +628,136 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
       status: 'draft',
     };
 
-    onSaveToHistory(historyEntry);
-    alert('Production calculation saved to History!');
+    try {
+      await Promise.resolve(onSaveToHistory(historyEntry));
+      setHistorySaveMessage({
+        status: 'saved',
+        text: 'Production calculation saved to History.',
+      });
+    } catch (err: any) {
+      setHistorySaveMessage({
+        status: 'error',
+        text:
+          err instanceof Error
+            ? err.message
+            : 'Unable to save production calculation to History.',
+      });
+    }
   };
 
   return (
     <div className="space-y-6 pb-20 md:pb-8">
       {/* Header */}
-      <div>
-        <h2 className="text-xl md:text-2xl font-bold text-[#5A534B] dark:text-[#EAE6E1] flex items-center gap-2">
-          <Calculator className="w-6 h-6 text-[#D4A373]" />
-          <span>Production Calculator</span>
-        </h2>
-        <p className="text-xs text-[#8B7E74] dark:text-[#A39E93]">
-          Combine packaging presets, adjust waste percentages, and validate mixer capacities.
-        </p>
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+        <div>
+          <h2 className="text-xl md:text-2xl font-bold text-[#5A534B] dark:text-[#EAE6E1] flex items-center gap-2">
+            <Calculator className="w-6 h-6 text-[#D4A373]" />
+            <span>Production Calculator</span>
+          </h2>
+          <p className="text-xs text-[#8B7E74] dark:text-[#A39E93]">
+            Combine packaging presets, adjust waste percentages, and validate mixer capacities.
+          </p>
+        </div>
+        <span
+          id="calc-safety-sync-status"
+          className={`self-start sm:self-auto px-2.5 py-1 rounded-full text-[11px] font-black uppercase tracking-wider border ${
+            syncStatusLabel === 'Safety Sync Ready'
+              ? 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-300 border-emerald-300 dark:border-emerald-700'
+              : syncStatusLabel === 'Safety Sync Failed'
+              ? 'bg-rose-50 dark:bg-rose-950/40 text-rose-800 dark:text-rose-300 border-rose-300 dark:border-rose-700'
+              : 'bg-amber-50 dark:bg-amber-950/40 text-amber-900 dark:text-amber-200 border-amber-300 dark:border-amber-700'
+          }`}
+        >
+          {syncStatusLabel}
+        </span>
       </div>
+
+      {/* Initial Firestore Hydration Safety Banner */}
+      {operationalGateState === 'INITIAL_LOADING' && (
+        <div
+          id="calc-hydration-loading-banner"
+          className="rounded-xl border-2 border-amber-400 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/40 p-4 text-xs sm:text-sm shadow-xs flex items-center justify-between gap-2.5 flex-wrap"
+        >
+          <div className="flex items-center gap-2.5">
+            <RefreshCw className="w-4 h-4 text-amber-700 dark:text-amber-400 animate-spin shrink-0" />
+            <span className="font-black text-amber-950 dark:text-amber-100">
+              {SAFETY_HYDRATION_LOADING_MESSAGE}
+            </span>
+          </div>
+          <span className="px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-amber-200/80 dark:bg-amber-900/60 text-amber-950 dark:text-amber-100">
+            {syncStatusLabel}
+          </span>
+        </div>
+      )}
+
+      {/* Wi-Fi Interruption / Unverified Live Connection Banner */}
+      {operationalGateState === 'CONNECTION_UNVERIFIED' && (
+        <div
+          id="calc-connection-unverified-banner"
+          className="rounded-xl border-2 border-amber-500 bg-amber-50 dark:bg-amber-950/40 p-4 text-xs sm:text-sm shadow-xs space-y-2.5"
+        >
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2 font-black text-amber-900 dark:text-amber-200 uppercase tracking-wider text-xs flex-wrap">
+                <AlertTriangle className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" />
+                <span>Live Safety Connection Unverified — Mixing Hold Active</span>
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-amber-500 text-white">
+                  {syncStatusLabel}
+                </span>
+              </div>
+              <p className="text-amber-950 dark:text-amber-100 font-bold leading-relaxed">
+                {SAFETY_CONNECTION_UNVERIFIED_MESSAGE}
+              </p>
+            </div>
+            <button
+              id="btn-calc-retry-safety-sync-unverified"
+              type="button"
+              onClick={handleRetrySafetySync}
+              className="inline-flex items-center justify-center gap-1.5 min-h-[38px] px-3.5 py-2 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-black text-xs shadow-xs transition cursor-pointer shrink-0"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Retry Safety Sync</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Fail-Closed Firestore Sync Error Banner */}
+      {operationalGateState === 'ERROR' && (
+        <div
+          id="calc-notes-sync-error-banner"
+          className="rounded-xl border-2 border-rose-500 bg-rose-50 dark:bg-rose-950/40 p-4 text-xs sm:text-sm shadow-xs space-y-2.5"
+        >
+          <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-2 font-black text-rose-900 dark:text-rose-200 uppercase tracking-wider text-xs flex-wrap">
+                <AlertTriangle className="w-4 h-4 text-rose-600 dark:text-rose-400 shrink-0" />
+                <span>Critical Production Notes Unavailable — Safety Hold Active</span>
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-rose-600 text-white">
+                  {syncStatusLabel}
+                </span>
+              </div>
+              <p className="text-rose-900 dark:text-rose-200 font-bold leading-relaxed">
+                {SAFETY_HYDRATION_ERROR_MESSAGE}
+              </p>
+              {effectiveSyncError && (
+                <p className="text-rose-800 dark:text-rose-300 text-xs leading-relaxed">
+                  Details: {effectiveSyncError}
+                </p>
+              )}
+            </div>
+            <button
+              id="btn-calc-retry-safety-sync"
+              type="button"
+              onClick={handleRetrySafetySync}
+              className="inline-flex items-center justify-center gap-1.5 min-h-[38px] px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-black text-xs shadow-xs transition cursor-pointer shrink-0"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span>Retry Safety Sync</span>
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* Left Input Column */}
@@ -375,6 +776,7 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
               value={selectedRecipeId}
               onChange={(e) => {
                 setSelectedRecipeId(e.target.value);
+                setWasteOverride(''); // Rule 8: Switching recipes clears temporary calculation overrides
                 setCalculationResult(null);
                 setCapacityOverridden(false);
               }}
@@ -397,7 +799,7 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
                 <div className="text-xs text-[#8B7E74] dark:text-[#A39E93] bg-[#F9F8F6] dark:bg-[#25221F] p-3 rounded-xl border border-[#EEECE8] dark:border-[#332F2B] space-y-1.5">
                   <div className="flex justify-between">
                     <span className="font-semibold text-[#5A534B] dark:text-[#D4CEC7]">Default Waste:</span>
-                    <span className="font-mono">{selectedRecipe.defaultWastePercent ?? settings.defaultWastePercent ?? 6}%</span>
+                    <span className="font-mono">{effectiveRecipeWaste}%</span>
                   </div>
                   <div className="flex justify-between">
                     <span className="font-semibold text-[#5A534B] dark:text-[#D4CEC7]">Ingredients:</span>
@@ -469,6 +871,7 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
                             {items.map((p) => (
                               <option key={p.id} value={p.id}>
                                 {p.name} — {p.finishedWeight} {p.weightUnit} ({p.quantityPerUnit} / {p.unitName})
+                                {!isPresetEnabledForProduction(p) ? ' (Hidden on Floor)' : ''}
                               </option>
                             ))}
                           </optgroup>
@@ -504,7 +907,7 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
                         step="1"
                         placeholder="Qty"
                         value={
-                          req.quantity === '' ||
+                          (req.quantity as unknown as string) === '' ||
                           req.quantity === undefined ||
                           req.quantity === null ||
                           isNaN(Number(req.quantity))
@@ -592,11 +995,14 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
                   step="any"
                   min="0"
                   max="100"
-                  placeholder={`Default (${selectedRecipe?.defaultWastePercent ?? settings.defaultWastePercent ?? 6}%)`}
+                  placeholder={`Default (${effectiveRecipeWaste}%)`}
                   value={wasteOverride}
                   onChange={(e) => handleLiveWasteChange(e.target.value)}
                   className="w-full px-3 py-2 text-sm bg-[#F9F8F6] dark:bg-[#25221F] border border-[#EEECE8] dark:border-[#332F2B] rounded-xl focus:border-[#D4A373] focus:outline-none dark:text-[#EAE6E1]"
                 />
+                <p className="text-[10px] text-[#8B7E74] dark:text-[#A39E93] mt-1">
+                  Leave blank to use recipe/bakery default ({effectiveRecipeWaste}%). Explicit 0% is supported.
+                </p>
               </div>
 
               <div>
@@ -611,12 +1017,13 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
                     setCapacityOverridden(false);
                     if (calculationResult && selectedRecipe) {
                       const mixerObj = mixers.find((m) => m.id === newMixerId);
-                      const overrideVal = wasteOverride !== '' ? parseFloat(wasteOverride) : undefined;
+                      const overrideVal = isValidWastePercent(wasteOverride) ? parseFloat(wasteOverride) : undefined;
                       const res = calculateProduction(selectedRecipe, requirements, {
                         overrideWastePercent: overrideVal,
                         defaultWastePercent: settings.defaultWastePercent,
                         mixer: mixerObj,
                         defaultWeightUnit: displayUnit,
+                        displayMode,
                         capacityOverridden: false,
                       });
                       setCalculationResult(res);
@@ -634,29 +1041,34 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
               </div>
             </div>
 
-            {/* Display Weight Unit Switcher */}
+            {/* Production Measurement Display Mode Selector (Phase 2B.5.5) */}
             <div>
               <label className="block text-xs font-semibold text-[#8B7E74] dark:text-[#A39E93] mb-1">
-                Display Weight Unit System
+                Measurement Display Mode
               </label>
-              <div className="flex items-center gap-2">
-                {WEIGHT_UNITS.map((u) => (
+              <div id="calc-display-mode-selector" className="flex items-center gap-1.5 flex-wrap">
+                {PRODUCTION_DISPLAY_MODES.map((mode) => (
                   <button
-                    key={u.value}
+                    key={mode.value}
+                    id={`calc-display-mode-${mode.value}`}
                     type="button"
                     onClick={() => {
-                      setDisplayUnit(u.value);
+                      setDisplayMode(mode.value);
+                      const unitForWeight = isWeightUnit(mode.value) ? (mode.value as WeightUnit) : displayUnit;
+                      if (isWeightUnit(mode.value)) {
+                        setDisplayUnit(unitForWeight);
+                      }
                       if (calculationResult && selectedRecipe) {
-                        handleCalculate(capacityOverridden, undefined, undefined, u.value);
+                        handleCalculate(capacityOverridden, undefined, undefined, unitForWeight, mode.value);
                       }
                     }}
-                    className={`flex-1 py-1.5 px-2 rounded-xl text-xs font-bold transition cursor-pointer ${
-                      displayUnit === u.value
-                        ? 'bg-[#D4A373] text-white shadow-sm'
+                    className={`flex-1 py-1.5 px-2 rounded-xl text-xs font-bold transition cursor-pointer text-center ${
+                      displayMode === mode.value
+                        ? 'bg-[#D4A373] text-white shadow-sm font-black'
                         : 'bg-[#F5F2ED] dark:bg-[#25221F] text-[#8B7E74] dark:text-[#A39E93] hover:bg-[#EEECE8]'
                     }`}
                   >
-                    {u.value.toUpperCase()}
+                    {mode.shortLabel}
                   </button>
                 ))}
               </div>
@@ -691,8 +1103,12 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
                 <div className="flex items-center gap-2 flex-wrap">
                   <button
                     id="calc-guided-mixing-btn"
-                    onClick={() => onStartGuidedMixing(calculationResult)}
-                    className="inline-flex items-center gap-1.5 bg-[#D4A373] hover:bg-[#C49363] text-white font-bold px-3.5 py-2 rounded-xl text-xs transition cursor-pointer shadow-sm"
+                    disabled={!canProceedWithMix}
+                    onClick={() => {
+                      if (!canProceedWithMix) return;
+                      onStartGuidedMixing(calculationResult);
+                    }}
+                    className="inline-flex items-center gap-1.5 bg-[#D4A373] hover:bg-[#C49363] text-white font-bold px-3.5 py-2 rounded-xl text-xs transition cursor-pointer shadow-sm disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     <Play className="w-3.5 h-3.5 fill-current" />
                     <span>Guided Mixing</span>
@@ -700,18 +1116,40 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
 
                   <button
                     id="calc-export-pdf-btn"
+                    disabled={!canProceedWithMix}
                     onClick={() => {
-                      const branding = store.getWorkspaceBranding();
-                      exportProductionSheetPDF(
-                        calculationResult,
-                        {
-                          displayName: branding.displayName || settings.businessName,
-                          paletteId: branding.paletteId,
-                        },
-                        decimals
-                      );
+                      if (!canProceedWithMix) return;
+                      try {
+                        const branding = store.getWorkspaceBranding();
+                        exportProductionSheetPDF(
+                          calculationResult,
+                          {
+                            displayName: branding.displayName || settings.businessName,
+                            paletteId: branding.paletteId,
+                          },
+                          decimals,
+                          {
+                            recipes,
+                            presets,
+                            activeWorkspaceId: effectiveWorkspaceId,
+                            recipesHydrationState: effectiveRecipesHydrationState,
+                            presetsHydrationState: effectivePresetsHydrationState,
+                            syncError: effectiveSyncError,
+                            connectionVerified: effectiveConnectionVerified,
+                            acknowledgedSafetySignature,
+                          }
+                        );
+                      } catch (err: unknown) {
+                        setHistorySaveMessage({
+                          status: 'error',
+                          text:
+                            err instanceof Error
+                              ? err.message
+                              : 'Unable to export production sheet PDF.',
+                        });
+                      }
                     }}
-                    className="inline-flex items-center gap-1.5 bg-[#5A534B] hover:bg-[#47413A] dark:bg-[#3D3732] text-white font-bold px-3 py-2 rounded-xl text-xs transition cursor-pointer"
+                    className="inline-flex items-center gap-1.5 bg-[#5A534B] hover:bg-[#47413A] dark:bg-[#3D3732] text-white font-bold px-3 py-2 rounded-xl text-xs transition cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     <FileText className="w-3.5 h-3.5" />
                     <span>Export PDF</span>
@@ -719,14 +1157,126 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
 
                   <button
                     id="calc-save-history-btn"
+                    disabled={!canProceedWithMix || !canSaveHistory}
+                    title={
+                      !canSaveHistory
+                        ? 'Viewer role is read-only — Editor or Owner access required to save batch history'
+                        : undefined
+                    }
                     onClick={handleSaveToHistoryClick}
-                    className="inline-flex items-center gap-1.5 bg-[#F5F2ED] dark:bg-[#25221F] border border-[#E5E1DA] dark:border-[#332F2B] text-[#5A534B] dark:text-[#D4CEC7] hover:bg-[#EEECE8] font-bold px-3 py-2 rounded-xl text-xs transition cursor-pointer"
+                    className="inline-flex items-center gap-1.5 bg-[#F5F2ED] dark:bg-[#25221F] border border-[#E5E1DA] dark:border-[#332F2B] text-[#5A534B] dark:text-[#D4CEC7] hover:bg-[#EEECE8] font-bold px-3 py-2 rounded-xl text-xs transition cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     <CheckCircle2 className="w-3.5 h-3.5 text-[#D4A373]" />
-                    <span>Save History</span>
+                    <span>{canSaveHistory ? 'Save History' : 'Save History (Read-Only)'}</span>
                   </button>
                 </div>
               </div>
+
+              {historySaveMessage && (
+                <div
+                  id="calc-history-save-status"
+                  className={`px-3.5 py-2.5 rounded-xl border text-xs font-bold flex items-center gap-2 ${
+                    historySaveMessage.status === 'saved'
+                      ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-300 dark:border-emerald-800 text-emerald-900 dark:text-emerald-200'
+                      : 'bg-rose-50 dark:bg-rose-950/30 border-rose-300 dark:border-rose-800 text-rose-900 dark:text-rose-200'
+                  }`}
+                >
+                  {historySaveMessage.status === 'saved' ? (
+                    <Check className="w-4 h-4 stroke-[3] shrink-0" />
+                  ) : (
+                    <AlertTriangle className="w-4 h-4 shrink-0" />
+                  )}
+                  <span>{historySaveMessage.text}</span>
+                </div>
+              )}
+
+              {/* Critical Production Notes Safety Gate (Recipe-Wide + Preset-Specific) */}
+              {(operationalGateState === 'READY' || operationalGateState === 'CONNECTION_UNVERIFIED') &&
+                hasSafetyNotes && (
+                <div
+                  id="calc-critical-notes-card"
+                  className={`rounded-xl border-2 p-4 text-xs sm:text-sm space-y-3 ${
+                    isNotesAcknowledged
+                      ? 'border-emerald-500 bg-emerald-50/70 dark:bg-emerald-950/30'
+                      : 'border-amber-500 bg-amber-50 dark:bg-amber-950/40'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <AlertTriangle
+                        className={`w-4 h-4 shrink-0 ${
+                          isNotesAcknowledged
+                            ? 'text-emerald-600 dark:text-emerald-400'
+                            : 'text-amber-600 dark:text-amber-400'
+                        }`}
+                      />
+                      <span
+                        className={`font-black uppercase tracking-wider text-xs ${
+                          isNotesAcknowledged
+                            ? 'text-emerald-900 dark:text-emerald-200'
+                            : 'text-amber-900 dark:text-amber-200'
+                        }`}
+                      >
+                        Critical Production Notes
+                      </span>
+                      <span
+                        id="calc-notes-status-badge"
+                        className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider ${
+                          isNotesAcknowledged
+                            ? 'bg-emerald-200/80 dark:bg-emerald-900/70 text-emerald-900 dark:text-emerald-200'
+                            : 'bg-amber-500 text-white'
+                        }`}
+                      >
+                        {isNotesAcknowledged ? 'REVIEWED' : 'REVIEW REQUIRED'}
+                      </span>
+                      {wasInvalidatedByLiveUpdate && !isNotesAcknowledged && (
+                        <span
+                          id="calc-notes-live-updated-badge"
+                          className="px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider bg-amber-700 text-white"
+                        >
+                          Updated Live — Re-Review Required
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="space-y-2.5 p-3 rounded-xl bg-white dark:bg-[#1E1B18] border border-amber-200 dark:border-amber-900/60">
+                    {safetyResolution.allInstructions.map((item) => (
+                      <div key={item.id} className="space-y-1">
+                        <div>
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider border ${
+                              item.scope === 'preset_specific'
+                                ? 'bg-amber-100 dark:bg-amber-950/80 text-amber-950 dark:text-amber-200 border-amber-300 dark:border-amber-700'
+                                : 'bg-stone-100 dark:bg-zinc-800 text-stone-800 dark:text-zinc-200 border-stone-300 dark:border-zinc-700'
+                            }`}
+                          >
+                            {item.scope === 'preset_specific' && item.presetName
+                              ? `Preset-Specific Critical Note — ${item.presetName}`
+                              : item.scopeLabel}
+                          </span>
+                        </div>
+                        <div className="text-amber-950 dark:text-amber-100 font-semibold leading-relaxed whitespace-pre-wrap break-words">
+                          {item.note}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {!isNotesAcknowledged && (
+                    <button
+                      id="btn-calc-acknowledge-notes"
+                      type="button"
+                      disabled={operationalGateState !== 'READY'}
+                      onClick={handleAcknowledgeSafetyNotes}
+                      className="w-full min-h-[42px] py-2.5 px-4 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-black text-xs sm:text-sm flex items-center justify-center gap-2 shadow-xs transition cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed"
+                    >
+                      <Check className="w-4 h-4 stroke-[3]" />
+                      <span>I HAVE READ THESE PRODUCTION NOTES</span>
+                    </button>
+                  )}
+                </div>
+              )}
 
               {/* Persistent Mixer Capacity Warning Banner if capacity exceeded */}
               {(calculationResult.isCapacityExceeded || calculationResult.capacityOverridden) && (
@@ -786,6 +1336,84 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
                 </div>
               </div>
 
+              {/* Read-Only Estimated Ingredient Cost Summary */}
+              <div
+                id="production-cost-summary"
+                className="p-3.5 bg-[#F9F8F6] dark:bg-[#25221F] rounded-xl border border-[#EEECE8] dark:border-[#332F2B] space-y-2"
+              >
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] uppercase tracking-widest font-bold text-[#8B7E74] dark:text-[#A39E93]">
+                      Estimated Ingredient Cost
+                    </span>
+                    {scaledCostResult?.isComplete ? (
+                      <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold bg-[#E8F5E9] dark:bg-[#1B382B] text-[#2D6A4F] dark:text-[#52B788]">
+                        Complete
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold bg-[#FDF2F0] dark:bg-[#2C1916] text-[#A65B48] dark:text-[#EAA89A]">
+                        Incomplete ({recipeCostSummary?.costedIngredientCount ?? 0} of {recipeCostSummary?.totalIngredientCount ?? 0} ingredients costed)
+                      </span>
+                    )}
+                  </div>
+
+                  {!scaledCostResult?.isComplete && recipeCostSummary && recipeCostSummary.missing.length > 0 && (
+                    <button
+                      id="view-missing-cost-btn"
+                      type="button"
+                      onClick={() => setShowCostDetails(!showCostDetails)}
+                      className="text-xs font-semibold text-[#D4A373] hover:text-[#C49363] hover:underline cursor-pointer flex items-center gap-1 self-start sm:self-auto"
+                    >
+                      <span>{showCostDetails ? 'Hide Missing Cost Information' : 'View Missing Cost Information'}</span>
+                      <ChevronDown className={`w-3.5 h-3.5 transition-transform ${showCostDetails ? 'rotate-180' : ''}`} />
+                    </button>
+                  )}
+                </div>
+
+                <div className="flex items-baseline gap-3 flex-wrap">
+                  {scaledCostResult?.isComplete && scaledCostResult.estimatedCost !== undefined ? (
+                    <>
+                      <div className="text-xl font-bold font-mono text-[#2D6A4F] dark:text-[#52B788]">
+                        ${scaledCostResult.estimatedCost.toFixed(2)}
+                      </div>
+                      {calculationResult.totalPieces > 0 && (
+                        <div className="text-xs text-[#8B7E74] dark:text-[#A39E93] font-mono">
+                          (${ (scaledCostResult.estimatedCost / calculationResult.totalPieces).toFixed(2)} / piece)
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <div className="text-xs text-[#8B7E74] dark:text-[#A39E93]">
+                      <span className="font-semibold text-[#C97B63] dark:text-[#EAA89A]">Incomplete</span> — {recipeCostSummary?.costedIngredientCount ?? 0} of {recipeCostSummary?.totalIngredientCount ?? 0} ingredients costed
+                    </div>
+                  )}
+                </div>
+
+                {/* Expandable Missing Cost Information Details */}
+                {showCostDetails && !scaledCostResult?.isComplete && recipeCostSummary && (
+                  <div id="missing-cost-details-panel" className="mt-2 pt-2 border-t border-[#EEECE8] dark:border-[#332F2B] space-y-1.5">
+                    <span className="text-[11px] font-bold text-[#5A534B] dark:text-[#EAE6E1] block">
+                      Missing Cost Details:
+                    </span>
+                    <div className="space-y-1">
+                      {recipeCostSummary.missing.map((item) => (
+                        <div
+                          key={item.ingredientId}
+                          className="flex flex-col sm:flex-row sm:items-center justify-between text-xs px-2.5 py-1.5 bg-white dark:bg-[#1E1B18] rounded-lg border border-[#EEECE8] dark:border-[#332F2B] gap-1"
+                        >
+                          <span className="font-semibold text-[#5A534B] dark:text-[#EAE6E1]">
+                            {item.ingredientName}
+                          </span>
+                          <span className="text-[#C97B63] dark:text-[#EAA89A] text-[11px]">
+                            {getHumanReadableReason(item.reason)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+
               {/* Ingredients Scaled Formula Table */}
               <div className="space-y-3 pt-2">
                 <div className="flex items-center justify-between flex-wrap gap-2">
@@ -798,10 +1426,41 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
                     </span>
                   </div>
 
-                  <div className="flex items-center gap-3">
-                    {Object.values(checkedIngredients).some(Boolean) && (
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {/* Quick Mode Switcher */}
+                    <div id="table-display-mode-selector" className="flex items-center bg-[#F5F2ED] dark:bg-[#25221F] p-0.5 rounded-lg border border-[#E5E1DA] dark:border-[#332F2B] text-[11px] font-bold">
+                      {PRODUCTION_DISPLAY_MODES.map((mode) => (
+                        <button
+                          key={mode.value}
+                          type="button"
+                          id={`table-display-mode-${mode.value}`}
+                          onClick={() => {
+                            setDisplayMode(mode.value);
+                            const unitForWeight = isWeightUnit(mode.value) ? (mode.value as WeightUnit) : displayUnit;
+                            if (isWeightUnit(mode.value)) {
+                              setDisplayUnit(unitForWeight);
+                            }
+                            if (calculationResult && selectedRecipe) {
+                              handleCalculate(capacityOverridden, undefined, undefined, unitForWeight, mode.value);
+                            }
+                          }}
+                          className={`px-2 py-0.5 rounded transition cursor-pointer ${
+                            displayMode === mode.value
+                              ? 'bg-[#D4A373] text-white shadow-xs font-black'
+                              : 'text-[#8B7E74] dark:text-[#A39E93] hover:text-[#5A534B]'
+                          }`}
+                        >
+                          {mode.shortLabel}
+                        </button>
+                      ))}
+                    </div>
+
+                    {Object.values(checkedIngredients).some(Boolean) && canProceedWithMix && (
                       <button
-                        onClick={() => setCheckedIngredients({})}
+                        onClick={() => {
+                          if (!canProceedWithMix) return;
+                          setCheckedIngredients({});
+                        }}
                         className="text-xs font-semibold text-[#8B7E74] hover:text-[#5A534B] dark:hover:text-[#EAE6E1] underline cursor-pointer"
                       >
                         Reset Checklist
@@ -815,7 +1474,68 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
                   </div>
                 </div>
 
-                <div className="overflow-x-auto rounded-xl border border-[#E5E1DA] dark:border-[#2D2925]">
+                {!canShowOperationalChecklist ? (
+                  <div
+                    id="calc-checklist-safety-gate"
+                    className={`p-6 rounded-xl border-2 border-dashed text-center space-y-3 ${
+                      operationalGateState === 'ERROR'
+                        ? 'border-rose-400 dark:border-rose-700 bg-rose-50/70 dark:bg-rose-950/20 text-rose-950 dark:text-rose-200'
+                        : 'border-amber-400 dark:border-amber-700 bg-amber-50/60 dark:bg-amber-950/20 text-amber-950 dark:text-amber-200'
+                    }`}
+                  >
+                    <div className="flex items-center justify-center">
+                      {operationalGateState === 'ERROR' ? (
+                        <AlertTriangle className="w-6 h-6 text-rose-600 dark:text-rose-400" />
+                      ) : operationalGateState === 'INITIAL_LOADING' ? (
+                        <RefreshCw className="w-6 h-6 text-amber-700 dark:text-amber-400 animate-spin" />
+                      ) : (
+                        <FileText className="w-6 h-6 text-amber-700 dark:text-amber-400" />
+                      )}
+                    </div>
+                    <p id="calc-notes-gate-notice" className="text-xs sm:text-sm font-black">
+                      {operationalGateState === 'INITIAL_LOADING'
+                        ? SAFETY_HYDRATION_LOADING_MESSAGE
+                        : operationalGateState === 'CONNECTION_UNVERIFIED'
+                        ? SAFETY_CONNECTION_UNVERIFIED_MESSAGE
+                        : operationalGateState === 'ERROR'
+                        ? SAFETY_HYDRATION_ERROR_MESSAGE
+                        : 'Review and acknowledge Critical Production Notes above to unlock the operational ingredient checklist, Guided Mixing, PDF export, and batch history logging.'}
+                    </p>
+                    {(operationalGateState === 'ERROR' ||
+                      operationalGateState === 'CONNECTION_UNVERIFIED') && (
+                      <div>
+                        <button
+                          id="btn-calc-gate-retry-safety-sync"
+                          type="button"
+                          onClick={handleRetrySafetySync}
+                          className={`inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-white font-bold text-xs shadow-xs transition cursor-pointer ${
+                            operationalGateState === 'ERROR'
+                              ? 'bg-rose-600 hover:bg-rose-500'
+                              : 'bg-amber-600 hover:bg-amber-500'
+                          }`}
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                          <span>Retry Safety Sync</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <>
+                    {!canProceedWithMix && (
+                      <div
+                        id="calc-notes-gate-notice"
+                        className="p-3.5 rounded-xl border border-dashed border-amber-400 dark:border-amber-700 bg-amber-50/70 dark:bg-amber-950/25 text-amber-950 dark:text-amber-200 text-xs font-bold text-center"
+                      >
+                        {SAFETY_CONNECTION_UNVERIFIED_MESSAGE}
+                      </div>
+                    )}
+
+                    <div
+                      className={`overflow-x-auto rounded-xl border border-[#E5E1DA] dark:border-[#332F2B] ${
+                        !canProceedWithMix ? 'opacity-65' : ''
+                      }`}
+                    >
                   <table className="w-full text-left">
                     <thead className="bg-[#F5F2ED] dark:bg-[#25221F] text-[#5A534B] dark:text-[#EAE6E1] font-bold uppercase text-xs tracking-wider">
                       <tr>
@@ -830,13 +1550,17 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
                         return (
                           <tr
                             key={ing.id}
-                            onClick={() =>
+                            id={`calc-ing-row-${ing.id}`}
+                            onClick={() => {
+                              if (!canProceedWithMix) return;
                               setCheckedIngredients((prev) => ({
                                 ...prev,
                                 [ing.id]: !prev[ing.id],
-                              }))
-                            }
-                            className={`cursor-pointer transition-all select-none ${
+                              }));
+                            }}
+                            className={`transition-all select-none ${
+                              !canProceedWithMix ? 'cursor-not-allowed' : 'cursor-pointer'
+                            } ${
                               isDone
                                 ? 'bg-[#F5F2ED]/60 dark:bg-[#25221F]/40 opacity-55'
                                 : 'hover:bg-[#F9F8F6] dark:hover:bg-[#25221F]/60'
@@ -946,6 +1670,8 @@ export const ProductionCalculator: React.FC<ProductionCalculatorProps> = ({
                     </tfoot>
                   </table>
                 </div>
+                  </>
+                )}
               </div>
             </div>
           ) : (

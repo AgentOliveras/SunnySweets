@@ -1,9 +1,16 @@
 import { initializeApp, getApps, getApp, FirebaseApp } from 'firebase/app';
 import {
+  initializeAuth,
   getAuth,
+  browserPopupRedirectResolver,
+  browserLocalPersistence,
+  indexedDBLocalPersistence,
+  browserSessionPersistence,
   onAuthStateChanged,
   User,
   Auth,
+  Persistence,
+  PopupRedirectResolver,
   GoogleAuthProvider,
   signInWithPopup,
   signOut,
@@ -19,27 +26,146 @@ import {
 } from 'firebase/storage';
 import firebaseConfigData from '../../firebase-applet-config.json';
 
+// Section 8: Verify required VITE_* or config JSON Firebase environment parameters
+const envMeta = (typeof import.meta !== 'undefined' && (import.meta as any).env) || {};
+const effectiveApiKey = envMeta.VITE_FIREBASE_API_KEY || firebaseConfigData.apiKey;
+const effectiveAuthDomain = envMeta.VITE_FIREBASE_AUTH_DOMAIN || firebaseConfigData.authDomain;
+const effectiveProjectId = envMeta.VITE_FIREBASE_PROJECT_ID || firebaseConfigData.projectId;
+const effectiveAppId = envMeta.VITE_FIREBASE_APP_ID || firebaseConfigData.appId;
+
 const firebaseConfig = {
-  apiKey: firebaseConfigData.apiKey,
-  authDomain: firebaseConfigData.authDomain,
-  projectId: firebaseConfigData.projectId,
-  storageBucket: firebaseConfigData.storageBucket,
-  messagingSenderId: firebaseConfigData.messagingSenderId,
-  appId: firebaseConfigData.appId,
+  apiKey: effectiveApiKey,
+  authDomain: effectiveAuthDomain,
+  projectId: effectiveProjectId,
+  storageBucket: envMeta.VITE_FIREBASE_STORAGE_BUCKET || firebaseConfigData.storageBucket,
+  messagingSenderId: envMeta.VITE_FIREBASE_MESSAGING_SENDER_ID || firebaseConfigData.messagingSenderId,
+  appId: effectiveAppId,
 };
 
 let app: FirebaseApp;
-if (!getApps().length) {
-  app = initializeApp(firebaseConfig);
-} else {
-  app = getApp();
+try {
+  if (!getApps().length) {
+    app = initializeApp(firebaseConfig);
+  } else {
+    app = getApp();
+  }
+} catch (initErr) {
+  console.error('[Firebase] initializeApp error:', initErr);
+  throw initErr;
 }
 
-export const auth: Auth = getAuth(app);
-export const db: Firestore = getFirestore(
-  app,
-  firebaseConfigData.firestoreDatabaseId || '(default)'
-);
+export const BROWSER_AUTH_PERSISTENCE_HIERARCHY: Persistence[] = [
+  browserLocalPersistence,
+  indexedDBLocalPersistence,
+  browserSessionPersistence,
+];
+
+export interface FirebaseAuthInitDependencies {
+  isBrowserRuntime?: boolean;
+  initializeAuthFn?: typeof initializeAuth;
+  getAuthFn?: typeof getAuth;
+  popupRedirectResolver?: PopupRedirectResolver;
+  persistence?: Persistence[];
+}
+
+/**
+ * Detects whether the current runtime supports browser Auth initialization.
+ * In Node test environments (`@firebase/auth` node-esm entry), `window` is undefined
+ * and `browserPopupRedirectResolver` is a non-callable sentinel error object.
+ */
+export function isBrowserAuthRuntime(
+  resolverCandidate: unknown = browserPopupRedirectResolver
+): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    typeof document !== 'undefined' &&
+    typeof resolverCandidate === 'function'
+  );
+}
+
+/**
+ * Resolves the singleton Firebase Auth instance for a FirebaseApp:
+ * - Browser: single `initializeAuth` call prioritizing `browserLocalPersistence`,
+ *   followed by `indexedDBLocalPersistence` (for existing session discovery/migration)
+ *   and `browserSessionPersistence`, with `browserPopupRedirectResolver`.
+ * - Node / already-initialized fallback: `getAuth(targetApp)` with zero duplicate instances.
+ */
+export function initializeFirebaseAuthSingleton(
+  targetApp: FirebaseApp,
+  deps?: FirebaseAuthInitDependencies
+): Auth {
+  const resolver = deps?.popupRedirectResolver ?? browserPopupRedirectResolver;
+  const useBrowserInit =
+    deps?.isBrowserRuntime !== undefined ? deps.isBrowserRuntime : isBrowserAuthRuntime(resolver);
+  const initAuthFn = deps?.initializeAuthFn ?? initializeAuth;
+  const getAuthFn = deps?.getAuthFn ?? getAuth;
+  const persistence = deps?.persistence ?? BROWSER_AUTH_PERSISTENCE_HIERARCHY;
+
+  if (useBrowserInit) {
+    try {
+      return initAuthFn(targetApp, {
+        popupRedirectResolver: resolver,
+        persistence,
+      });
+    } catch (browserAuthErr: unknown) {
+      const errCode =
+        browserAuthErr && typeof browserAuthErr === 'object' && 'code' in browserAuthErr
+          ? String((browserAuthErr as { code?: unknown }).code)
+          : '';
+      if (errCode === 'auth/already-initialized') {
+        return getAuthFn(targetApp);
+      }
+      throw browserAuthErr;
+    }
+  }
+
+  return getAuthFn(targetApp);
+}
+
+let authInstance: Auth;
+try {
+  if (isBrowserAuthRuntime()) {
+    try {
+      authInstance = initializeAuth(app, {
+        popupRedirectResolver: browserPopupRedirectResolver,
+        persistence: [
+          browserLocalPersistence,
+          indexedDBLocalPersistence,
+          browserSessionPersistence,
+        ],
+      });
+    } catch (browserInitErr: unknown) {
+      const code =
+        browserInitErr && typeof browserInitErr === 'object' && 'code' in browserInitErr
+          ? String((browserInitErr as { code?: unknown }).code)
+          : '';
+      if (code === 'auth/already-initialized') {
+        authInstance = getAuth(app);
+      } else {
+        throw browserInitErr;
+      }
+    }
+  } else {
+    authInstance = getAuth(app);
+  }
+} catch (authErr) {
+  console.error('[Firebase] getAuth error:', authErr);
+  throw authErr;
+}
+export const auth: Auth = authInstance;
+
+let firestoreInstance: Firestore;
+try {
+  firestoreInstance = getFirestore(
+    app,
+    firebaseConfigData.firestoreDatabaseId || '(default)'
+  );
+} catch (fsErr) {
+  console.error('[Firebase] getFirestore error:', fsErr);
+  throw fsErr;
+}
+export const db: Firestore = firestoreInstance;
+
 export const storage: FirebaseStorage = getStorage(app);
 
 export enum OperationType {
@@ -108,15 +234,70 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   return errInfo;
 }
 
-export async function signInWithGoogle(): Promise<User | null> {
-  try {
-    const provider = new GoogleAuthProvider();
-    const result = await signInWithPopup(auth, provider);
-    return result.user;
-  } catch (err) {
-    console.error('Google Sign-In Error:', err);
-    return null;
+type GooglePopupExecutor = () => Promise<User>;
+
+let signInInFlightPromise: Promise<User> | null = null;
+let customPopupExecutorForTesting: GooglePopupExecutor | null = null;
+
+function isDevOrTestRuntime(): boolean {
+  return Boolean(
+    (typeof process !== 'undefined' &&
+      (process.env?.NODE_ENV === 'test' || Boolean(process.env?.NODE_TEST_CONTEXT))) ||
+      (typeof import.meta !== 'undefined' && (import.meta as any)?.env?.DEV)
+  );
+}
+
+/**
+ * Automated testing hook (strictly disabled in production builds) to simulate
+ * Google popup resolution, rejection with specific FirebaseError codes, and
+ * concurrent double-tap calls without opening real browser windows.
+ */
+export function setGooglePopupExecutorForTesting(executor: GooglePopupExecutor | null): void {
+  if (!isDevOrTestRuntime()) {
+    return;
   }
+  customPopupExecutorForTesting = executor;
+  signInInFlightPromise = null;
+}
+
+export function isGoogleSignInInFlight(): boolean {
+  return signInInFlightPromise !== null;
+}
+
+export async function signInWithGoogle(): Promise<User> {
+  if (signInInFlightPromise) {
+    return signInInFlightPromise;
+  }
+
+  signInInFlightPromise = (async () => {
+    try {
+      if (customPopupExecutorForTesting && isDevOrTestRuntime()) {
+        const mockedUser = await customPopupExecutorForTesting();
+        if (!mockedUser) {
+          const emptyErr = new Error('Google sign-in completed without returning an authenticated user.');
+          (emptyErr as Error & { code: string }).code = 'auth/null-user-credential';
+          throw emptyErr;
+        }
+        return mockedUser;
+      }
+
+      const provider = new GoogleAuthProvider();
+      const result = await signInWithPopup(auth, provider);
+      if (!result || !result.user) {
+        const emptyErr = new Error('Google sign-in completed without returning an authenticated user.');
+        (emptyErr as Error & { code: string }).code = 'auth/null-user-credential';
+        throw emptyErr;
+      }
+      return result.user;
+    } catch (err) {
+      console.error('Google Sign-In Error:', err);
+      throw err;
+    } finally {
+      signInInFlightPromise = null;
+    }
+  })();
+
+  return signInInFlightPromise;
 }
 
 export async function logoutUser(): Promise<void> {

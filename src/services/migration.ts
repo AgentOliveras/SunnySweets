@@ -7,7 +7,13 @@ import {
 } from 'firebase/firestore';
 import { db, auth, sanitizeForFirestore } from './firebase';
 import { store } from './store';
-import { Workspace, WorkspaceMemberDoc } from '../types';
+import { AccessRole, Workspace, WorkspaceMemberDoc } from '../types';
+
+export function assertOwnerForPhase0Migration(role: AccessRole | null | undefined): void {
+  if (role !== 'owner') {
+    throw new Error('Permission denied: Phase 0 Migration utilities are restricted to workspace Owners.');
+  }
+}
 
 export interface MigrationScanReport {
   workspaceId: string;
@@ -64,11 +70,12 @@ export interface MigrationExecutionResult {
  */
 export async function scanForLegacyData(): Promise<MigrationScanReport> {
   const currentUser = auth.currentUser;
+  const callerRole = store.getUserRole();
   const targetWorkspaceId = 'ws-main';
 
   const report: MigrationScanReport = {
     workspaceId: targetWorkspaceId,
-    isOwnerAuthenticated: !!currentUser,
+    isOwnerAuthenticated: Boolean(currentUser && callerRole === 'owner'),
     currentUserUid: currentUser?.uid || null,
     currentUserEmail: currentUser?.email || null,
     currentUserEmailVerified: currentUser?.emailVerified === true,
@@ -83,6 +90,11 @@ export async function scanForLegacyData(): Promise<MigrationScanReport> {
     alreadyMigratedCount: 0,
     isFullyMigrated: false,
   };
+
+  // Phase A Security Guard: Non-owners (Editors, Viewers, unauthenticated) cannot scan database
+  if (callerRole !== 'owner') {
+    return report;
+  }
 
   if (!currentUser) {
     const localRecipes = store.getRecipes(true);
@@ -227,6 +239,19 @@ export async function scanForLegacyData(): Promise<MigrationScanReport> {
  */
 export async function executePhase0Migration(): Promise<MigrationExecutionResult> {
   const currentUser = auth.currentUser;
+  const callerRole = store.getUserRole();
+
+  if (callerRole !== 'owner') {
+    const deniedReason = 'Permission denied: Only active workspace Owners can execute Phase 0 Migration.';
+    return {
+      success: false,
+      status: 'MIGRATION INCOMPLETE — DO NOT DEPLOY FINAL RULES',
+      message: `STOP MIGRATION: ${deniedReason}`,
+      migratedCounts: { recipes: 0, presets: 0, mixers: 0, history: 0, ingredients: 0, workspaceMembers: 0 },
+      failures: { recipes: 0, presets: 0, mixers: 0, history: 0, ingredients: 0, workspaceMembership: 1 },
+      errors: [deniedReason],
+    };
+  }
 
   // Strict identity validation (Requirement 5 & 9)
   if (!currentUser || !currentUser.uid || !currentUser.email || currentUser.emailVerified !== true) {
@@ -275,9 +300,25 @@ export async function executePhase0Migration(): Promise<MigrationExecutionResult
 
   const errors: string[] = [];
 
-  // 1. Ensure Workspace Document exists and has ownerId
+  // 1. Ensure Workspace Document exists and verify caller matches existing ownerId (prevent ownership hijack)
   try {
     const wsRef = doc(db, 'workspaces', targetWorkspaceId);
+    const remoteWsSnap = await getDoc(wsRef);
+    if (remoteWsSnap.exists()) {
+      const existingOwnerId = remoteWsSnap.data()?.ownerId;
+      if (existingOwnerId && existingOwnerId !== ownerUid) {
+        const mismatchMsg = 'Existing workspace ownerId does not match authenticated user UID. Migration aborted.';
+        return {
+          success: false,
+          status: 'MIGRATION INCOMPLETE — DO NOT DEPLOY FINAL RULES',
+          message: `STOP MIGRATION: ${mismatchMsg}`,
+          migratedCounts,
+          failures: { ...failures, workspaceMembership: 1 },
+          errors: [mismatchMsg],
+        };
+      }
+    }
+
     const existingWs = store.getActiveWorkspace();
     const wsData: Partial<Workspace> = {
       id: targetWorkspaceId,

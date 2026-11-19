@@ -12,9 +12,10 @@ import { store } from '../services/store';
 
 interface AccessDeniedScreenProps {
   onAccessGranted?: () => void;
+  onBackToSetup?: () => void;
 }
 
-export const AccessDeniedScreen: React.FC<AccessDeniedScreenProps> = ({ onAccessGranted }) => {
+export const AccessDeniedScreen: React.FC<AccessDeniedScreenProps> = ({ onAccessGranted, onBackToSetup }) => {
   const [isChecking, setIsChecking] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [copiedUid, setCopiedUid] = useState(false);
@@ -154,6 +155,18 @@ export const AccessDeniedScreen: React.FC<AccessDeniedScreenProps> = ({ onAccess
               <span>Sign Out</span>
             </button>
           </div>
+
+          {onBackToSetup && (
+            <div className="pt-2 text-center border-t border-[#EEECE8] dark:border-[#332F2B]">
+              <button
+                type="button"
+                onClick={onBackToSetup}
+                className="text-xs text-[#D4A373] hover:text-[#C49363] font-semibold underline cursor-pointer"
+              >
+                ← Set up your own new bakery workspace instead
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Footer */}

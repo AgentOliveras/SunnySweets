@@ -19,10 +19,19 @@ import {
   SlidersHorizontal,
   Scale,
   Eye,
+  DollarSign,
+  Calculator,
+  AlertTriangle,
+  CheckCircle2,
+  Info,
+  Link2,
 } from 'lucide-react';
 import { Recipe, Ingredient, ProductionHistoryEntry, MasterIngredient, UserSettings, AccessRole, WeightUnit } from '../types';
 import { getUnitLabel, WEIGHT_UNITS, isWeightUnit, convertWeight, standardizeIngredientsToUnit, standardizeIngredientToUnit } from '../utils/units';
 import { calculateRecipeTotal } from '../utils/calculator';
+import { calculateRecipeCostSummary, calculateIngredientCost } from '../utils/costing';
+import { findMatchSuggestion } from '../services/masterIngredientLinking';
+import { IngredientLinkSelectorModal } from './IngredientLinkSelectorModal';
 
 const DEFAULT_CATEGORIES = [
   'Cookies',
@@ -68,6 +77,7 @@ export const RecipeManager: React.FC<RecipeManagerProps> = ({
   onSaveMasterIngredient,
   openModalDirectly = false,
 }) => {
+  const isOwner = userRole === 'owner';
   const isEditorOrOwner = userRole === 'owner' || userRole === 'editor';
   const [searchTerm, setSearchTerm] = useState('');
   const [showArchived, setShowArchived] = useState(false);
@@ -100,6 +110,7 @@ export const RecipeManager: React.FC<RecipeManagerProps> = ({
 
   const [isCustomCategoryInput, setIsCustomCategoryInput] = useState(false);
   const [customCategoryText, setCustomCategoryText] = useState('');
+  const [linkModalIdx, setLinkModalIdx] = useState<number | null>(null);
 
   // Extract all existing unique categories
   const existingCategories = useMemo(() => {
@@ -260,7 +271,7 @@ export const RecipeManager: React.FC<RecipeManagerProps> = ({
     // Recipe should not save if there is an ingredient with blank amount
     const hasBlankIngredient = editingRecipe.ingredients.some(
       (ing) =>
-        ing.quantity === '' ||
+        (ing.quantity as unknown as string) === '' ||
         ing.quantity === undefined ||
         ing.quantity === null ||
         isNaN(Number(ing.quantity))
@@ -280,29 +291,65 @@ export const RecipeManager: React.FC<RecipeManagerProps> = ({
       ? customCategoryText.trim() || 'Uncategorized'
       : editingRecipe.category || 'Uncategorized';
 
-    // Auto-save new recipe ingredients to Master Ingredients pantry
-    if (onSaveMasterIngredient) {
-      cleanedIngredients.forEach((ing) => {
-        if (!ing.name.trim()) return;
-        const nameClean = ing.name.trim();
-        const exists = masterIngredients.some(
-          (m) => m.name.toLowerCase() === nameClean.toLowerCase()
-        );
-        if (!exists) {
-          onSaveMasterIngredient({
-            id: `mi-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-            name: nameClean,
-            category: 'General',
-            defaultUnit: ing.unit || defaultUnit,
-            defaultWastePercent: ing.wastePercent ?? 0,
-          });
-        }
-      });
-    }
+    // Link ingredients to MasterIngredients:
+    // 1. If already linked, preserve masterIngredientId.
+    // 2. If exact case-insensitive match exists in pantry, link to existing MasterIngredient without creating duplicate.
+    // 3. If no pantry match, create new MasterIngredient (if onSaveMasterIngredient provided) and link the new ID.
+    // Track newly created master ingredients in this save pass to prevent duplicate creations within same recipe.
+    const newlyCreatedMasters = new Map<string, string>();
+
+    const linkedIngredients = cleanedIngredients.map((ing) => {
+      const nameClean = ing.name.trim();
+      if (!nameClean) return ing;
+      const lowerName = nameClean.toLowerCase();
+
+      // Case 1: Already has a masterIngredientId
+      if (ing.masterIngredientId) {
+        return ing;
+      }
+
+      // Case 2: Exact case-insensitive match in existing pantry masterIngredients
+      const existingMatch = masterIngredients.find(
+        (m) => m.name.trim().toLowerCase() === lowerName
+      );
+      if (existingMatch) {
+        return {
+          ...ing,
+          masterIngredientId: existingMatch.id,
+        };
+      }
+
+      // Case 3: Already created earlier in this save pass
+      if (newlyCreatedMasters.has(lowerName)) {
+        return {
+          ...ing,
+          masterIngredientId: newlyCreatedMasters.get(lowerName)!,
+        };
+      }
+
+      // Case 4: No pantry match - create new MasterIngredient and link new ID
+      if (onSaveMasterIngredient) {
+        const newMasterId = `mi-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+        newlyCreatedMasters.set(lowerName, newMasterId);
+        onSaveMasterIngredient({
+          id: newMasterId,
+          name: nameClean,
+          category: 'General',
+          defaultUnit: ing.unit || defaultUnit,
+          defaultWastePercent: ing.wastePercent ?? 0,
+        });
+        return {
+          ...ing,
+          masterIngredientId: newMasterId,
+        };
+      }
+
+      return ing;
+    });
 
     onSaveRecipe({
       ...editingRecipe,
-      ingredients: cleanedIngredients,
+      ingredients: linkedIngredients,
       category: finalCategory,
     });
     setEditingRecipe(null);
@@ -389,6 +436,7 @@ export const RecipeManager: React.FC<RecipeManagerProps> = ({
     const usages = usageCountMap.get(recipe.id) || 0;
     const cardUnit = cardUnits[recipe.id] || settings?.defaultWeightUnit || 'g';
     const recipeTotal = calculateRecipeTotal(recipe, cardUnit, settings?.decimalPlaces);
+    const costSummary = calculateRecipeCostSummary(recipe, masterIngredients);
 
     return (
       <div
@@ -526,6 +574,33 @@ export const RecipeManager: React.FC<RecipeManagerProps> = ({
                   </span>
                 </div>
               )}
+
+              {/* Phase 2.0B Recipe Cost Summary */}
+              <div className="pt-2 border-t border-[#EEECE8] dark:border-[#332F2B] space-y-1">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-[#8B7E74] font-medium flex items-center gap-1">
+                    <DollarSign className="w-3.5 h-3.5 text-[#D4A373]" />
+                    <span>Ingredient Cost:</span>
+                  </span>
+                  <span className="font-bold font-mono text-sm text-[#5A534B] dark:text-[#EAE6E1]">
+                    {costSummary.costComplete ? (
+                      `$${costSummary.totalIngredientCost.toFixed(2)}`
+                    ) : (
+                      <span className="text-[11px] font-normal text-[#8B7E74] dark:text-[#A39E93]">
+                        Incomplete ({costSummary.costedIngredientCount}/{costSummary.totalIngredientCount})
+                      </span>
+                    )}
+                  </span>
+                </div>
+                {costSummary.costComplete && costSummary.costPerYieldUnit !== undefined && (
+                  <div className="text-[10px] text-[#8B7E74] dark:text-[#A39E93] flex justify-between font-mono">
+                    <span>Per {recipe.batchYieldUnit || 'piece'}:</span>
+                    <span className="font-semibold text-[#5A534B] dark:text-[#D4CEC7]">
+                      ${costSummary.costPerYieldUnit.toFixed(2)}
+                    </span>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -575,18 +650,20 @@ export const RecipeManager: React.FC<RecipeManagerProps> = ({
                 >
                   <Archive className="w-4 h-4" />
                 </button>
-                <button
-                  id={`recipe-delete-btn-${recipe.id}`}
-                  onClick={() => {
-                    if (confirm(`Delete "${recipe.name}" permanently?`)) {
-                      onDeleteRecipe(recipe.id);
-                    }
-                  }}
-                  title="Delete Recipe"
-                  className="p-1.5 text-[#C97B63] hover:text-red-700 hover:bg-[#FDF2F0] dark:hover:bg-[#2C1916] rounded-lg transition cursor-pointer"
-                >
-                  <Trash2 className="w-4 h-4" />
-                </button>
+                {isOwner && (
+                  <button
+                    id={`recipe-delete-btn-${recipe.id}`}
+                    onClick={() => {
+                      if (confirm(`Delete "${recipe.name}" permanently?`)) {
+                        onDeleteRecipe(recipe.id);
+                      }
+                    }}
+                    title="Delete Recipe (Owner Only)"
+                    className="p-1.5 text-[#C97B63] hover:text-red-700 hover:bg-[#FDF2F0] dark:hover:bg-[#2C1916] rounded-lg transition cursor-pointer"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                )}
               </>
             )}
           </div>
@@ -735,12 +812,14 @@ export const RecipeManager: React.FC<RecipeManagerProps> = ({
           {Object.keys(groupedByCategory).length === 0 && (
             <div className="py-12 text-center text-[#A39E93] text-sm bg-white dark:bg-[#1E1B18] rounded-xl border border-dashed border-[#E5E1DA] dark:border-[#2D2925] p-8">
               <p className="mb-2">No recipes found matching criteria.</p>
-              <button
-                onClick={handleCreateNew}
-                className="text-[#D4A373] font-bold underline cursor-pointer"
-              >
-                Create a new recipe
-              </button>
+              {isEditorOrOwner && (
+                <button
+                  onClick={handleCreateNew}
+                  className="text-[#D4A373] font-bold underline cursor-pointer"
+                >
+                  Create a new recipe
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -752,12 +831,14 @@ export const RecipeManager: React.FC<RecipeManagerProps> = ({
           {sortedRecipes.length === 0 && (
             <div className="col-span-full py-12 text-center text-[#A39E93] text-sm bg-white dark:bg-[#1E1B18] rounded-xl border border-dashed border-[#E5E1DA] dark:border-[#2D2925] p-8">
               <p className="mb-2">No recipes found matching criteria.</p>
-              <button
-                onClick={handleCreateNew}
-                className="text-[#D4A373] font-bold underline cursor-pointer"
-              >
-                Create a new recipe
-              </button>
+              {isEditorOrOwner && (
+                <button
+                  onClick={handleCreateNew}
+                  className="text-[#D4A373] font-bold underline cursor-pointer"
+                >
+                  Create a new recipe
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -861,17 +942,44 @@ export const RecipeManager: React.FC<RecipeManagerProps> = ({
                 </div>
 
                 <div className="sm:col-span-2">
-                  <label className="block text-xs font-semibold text-[#8B7E74] dark:text-[#A39E93] mb-1">
-                    Description / Notes
-                  </label>
-                  <input
-                    type="text"
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="block text-xs font-semibold text-[#8B7E74] dark:text-[#A39E93]">
+                      Critical Production Notes (Safety / Handling Gate)
+                    </label>
+                    <span className="text-[10px] text-amber-700 dark:text-amber-400 font-bold uppercase">
+                      Requires Floor Acknowledgment
+                    </span>
+                  </div>
+                  <textarea
+                    rows={2}
+                    id="recipe-edit-description"
                     disabled={!isEditorOrOwner}
-                    placeholder="e.g., Chewy brown sugar dough base"
+                    placeholder="e.g., Add inclusions during final 60 seconds of mixing. Do not overmix."
                     value={editingRecipe.description}
                     onChange={(e) => setEditingRecipe({ ...editingRecipe, description: e.target.value })}
-                    className="w-full px-3 py-2 text-sm bg-[#F9F8F6] dark:bg-[#25221F] border border-[#EEECE8] dark:border-[#332F2B] rounded-xl focus:border-[#D4A373] focus:outline-none dark:text-[#EAE6E1] disabled:opacity-75"
+                    className="w-full px-3 py-2 text-sm bg-[#F9F8F6] dark:bg-[#25221F] border border-[#EEECE8] dark:border-[#332F2B] rounded-xl focus:border-[#D4A373] focus:outline-none dark:text-[#EAE6E1] disabled:opacity-75 resize-y"
                   />
+                  <p className="text-[10px] text-[#8B7E74] dark:text-[#A39E93] mt-0.5">
+                    Critical notes trigger a mandatory operator review and acknowledgment checkbox in Production Floor Mode.
+                  </p>
+                </div>
+
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-semibold text-[#8B7E74] dark:text-[#A39E93] mb-1">
+                    General Mixing Instructions (Step-by-Step SOP)
+                  </label>
+                  <textarea
+                    rows={3}
+                    id="recipe-edit-mixing-instructions"
+                    disabled={!isEditorOrOwner}
+                    placeholder="e.g., 1. Cream butter and sugar on Speed 2 for 3 mins.&#10;2. Add eggs slowly.&#10;3. Fold in flour on Speed 1."
+                    value={editingRecipe.mixingInstructions || ''}
+                    onChange={(e) => setEditingRecipe({ ...editingRecipe, mixingInstructions: e.target.value })}
+                    className="w-full px-3 py-2 text-sm bg-[#F9F8F6] dark:bg-[#25221F] border border-[#EEECE8] dark:border-[#332F2B] rounded-xl focus:border-[#D4A373] focus:outline-none dark:text-[#EAE6E1] disabled:opacity-75 resize-y"
+                  />
+                  <p className="text-[10px] text-[#8B7E74] dark:text-[#A39E93] mt-0.5">
+                    Accessible to operators on the production floor and in guided mixing checklist view.
+                  </p>
                 </div>
 
                 <div>
@@ -943,39 +1051,41 @@ export const RecipeManager: React.FC<RecipeManagerProps> = ({
                       Specify exact ingredient amounts. All inputs can be standardized to your setup preference.
                     </p>
                   </div>
-                  <div className="flex items-center gap-2">
-                    {/* Sort Recipe Ingredients Dropdown */}
-                    <div className="flex items-center gap-1 bg-[#F5F2ED] dark:bg-[#25221F] border border-[#EEECE8] dark:border-[#332F2B] px-2.5 py-1 rounded-lg text-xs">
-                      <ArrowUpDown className="w-3 h-3 text-[#D4A373] shrink-0" />
-                      <select
-                        onChange={(e) => {
-                          if (e.target.value) {
-                            handleSortRecipeIngredients(e.target.value);
-                            e.target.value = '';
-                          }
-                        }}
-                        defaultValue=""
-                        className="bg-transparent font-bold text-[#5A534B] dark:text-[#EAE6E1] focus:outline-none cursor-pointer text-xs"
-                      >
-                        <option value="" disabled>Sort Ingredients...</option>
-                        <option value="alphabetical">Alphabetical Order (A-Z)</option>
-                        <option value="category">Category</option>
-                        <option value="recently_added">Recently Added</option>
-                        <option value="oldest_added">Oldest Added</option>
-                        <option value="ascending">Ascending (Qty)</option>
-                        <option value="descending">Descending (Qty)</option>
-                      </select>
-                    </div>
+                  {isEditorOrOwner && (
+                    <div className="flex items-center gap-2">
+                      {/* Sort Recipe Ingredients Dropdown */}
+                      <div className="flex items-center gap-1 bg-[#F5F2ED] dark:bg-[#25221F] border border-[#EEECE8] dark:border-[#332F2B] px-2.5 py-1 rounded-lg text-xs">
+                        <ArrowUpDown className="w-3 h-3 text-[#D4A373] shrink-0" />
+                        <select
+                          onChange={(e) => {
+                            if (e.target.value) {
+                              handleSortRecipeIngredients(e.target.value);
+                              e.target.value = '';
+                            }
+                          }}
+                          defaultValue=""
+                          className="bg-transparent font-bold text-[#5A534B] dark:text-[#EAE6E1] focus:outline-none cursor-pointer text-xs"
+                        >
+                          <option value="" disabled>Sort Ingredients...</option>
+                          <option value="alphabetical">Alphabetical Order (A-Z)</option>
+                          <option value="category">Category</option>
+                          <option value="recently_added">Recently Added</option>
+                          <option value="oldest_added">Oldest Added</option>
+                          <option value="ascending">Ascending (Qty)</option>
+                          <option value="descending">Descending (Qty)</option>
+                        </select>
+                      </div>
 
-                    <button
-                      type="button"
-                      onClick={handleAddIngredient}
-                      className="inline-flex items-center gap-1 bg-[#D4A373] hover:bg-[#C49363] text-white font-bold px-3 py-1.5 rounded-lg text-xs cursor-pointer shadow-sm transition"
-                    >
-                      <Plus className="w-3.5 h-3.5" />
-                      <span>Add Ingredient</span>
-                    </button>
-                  </div>
+                      <button
+                        type="button"
+                        onClick={handleAddIngredient}
+                        className="inline-flex items-center gap-1 bg-[#D4A373] hover:bg-[#C49363] text-white font-bold px-3 py-1.5 rounded-lg text-xs cursor-pointer shadow-sm transition"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        <span>Add Ingredient</span>
+                      </button>
+                    </div>
+                  )}
                 </div>
 
                 {/* Measuring Unit Setup Preference & Standardization Bar */}
@@ -1029,25 +1139,100 @@ export const RecipeManager: React.FC<RecipeManagerProps> = ({
                           )}
 
                           {/* Quick conversion pill selector */}
-                          <div className="hidden sm:flex items-center gap-0.5 bg-white dark:bg-[#1E1B18] p-0.5 rounded-lg border border-[#EEECE8] dark:border-[#332F2B]">
-                            {WEIGHT_UNITS.map((u) => (
-                              <button
-                                key={u.value}
-                                type="button"
-                                onClick={() => handleStandardizeAllIngredients(u.value)}
-                                className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-bold transition cursor-pointer ${
-                                  defaultUnit === u.value
-                                    ? 'bg-[#D4A373] text-white'
-                                    : 'text-[#8B7E74] hover:text-[#5A534B] dark:text-[#A39E93] dark:hover:text-[#EAE6E1]'
-                                }`}
-                                title={`Convert all ingredients to ${u.label}`}
-                              >
-                                {u.value}
-                              </button>
-                            ))}
-                          </div>
+                          {isEditorOrOwner && (
+                            <div className="hidden sm:flex items-center gap-0.5 bg-white dark:bg-[#1E1B18] p-0.5 rounded-lg border border-[#EEECE8] dark:border-[#332F2B]">
+                              {WEIGHT_UNITS.map((u) => (
+                                <button
+                                  key={u.value}
+                                  type="button"
+                                  onClick={() => handleStandardizeAllIngredients(u.value)}
+                                  className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-bold transition cursor-pointer ${
+                                    defaultUnit === u.value
+                                      ? 'bg-[#D4A373] text-white'
+                                      : 'text-[#8B7E74] hover:text-[#5A534B] dark:text-[#A39E93] dark:hover:text-[#EAE6E1]'
+                                  }`}
+                                  title={`Convert all ingredients to ${u.label}`}
+                                >
+                                  {u.value}
+                                </button>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Phase 2.0B Recipe Cost Summary Header Card */}
+                {(() => {
+                  const modalCost = calculateRecipeCostSummary(editingRecipe, masterIngredients);
+                  return (
+                    <div className="p-3.5 bg-[#F9F8F6] dark:bg-[#25221F] rounded-xl border border-[#EEECE8] dark:border-[#332F2B] space-y-2">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <DollarSign className="w-4 h-4 text-[#D4A373]" />
+                          <span className="text-xs font-bold text-[#5A534B] dark:text-[#EAE6E1]">
+                            Recipe Ingredient Cost (Phase 2.0B)
+                          </span>
+                        </div>
+                        <span
+                          className={`text-[11px] font-bold font-mono px-2 py-0.5 rounded-md ${
+                            modalCost.costComplete
+                              ? 'bg-[#2D6A4F]/10 text-[#2D6A4F] dark:text-[#52B788]'
+                              : 'bg-[#C97B63]/10 text-[#C97B63] dark:text-[#EAA89A]'
+                          }`}
+                        >
+                          {modalCost.costComplete
+                            ? 'Complete'
+                            : `Incomplete (${modalCost.costedIngredientCount}/${modalCost.totalIngredientCount} costed)`}
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 pt-1 font-mono text-xs">
+                        <div className="bg-white dark:bg-[#1E1B18] p-2 rounded-lg border border-[#EEECE8] dark:border-[#332F2B]">
+                          <span className="text-[10px] uppercase font-sans text-[#8B7E74] block">Total Batch Cost</span>
+                          <span className="text-sm font-bold text-[#5A534B] dark:text-[#EAE6E1]">
+                            {modalCost.costComplete ? `$${modalCost.totalIngredientCost.toFixed(2)}` : 'Incomplete'}
+                          </span>
+                        </div>
+
+                        <div className="bg-white dark:bg-[#1E1B18] p-2 rounded-lg border border-[#EEECE8] dark:border-[#332F2B]">
+                          <span className="text-[10px] uppercase font-sans text-[#8B7E74] block">
+                            Per {editingRecipe.batchYieldUnit || 'Unit'}
+                          </span>
+                          <span className="text-sm font-bold text-[#D4A373]">
+                            {modalCost.costComplete && modalCost.costPerYieldUnit !== undefined
+                              ? `$${modalCost.costPerYieldUnit.toFixed(2)}`
+                              : '—'}
+                          </span>
+                        </div>
+
+                        <div className="bg-white dark:bg-[#1E1B18] p-2 rounded-lg border border-[#EEECE8] dark:border-[#332F2B] col-span-2 sm:col-span-1">
+                          <span className="text-[10px] uppercase font-sans text-[#8B7E74] block">Yield</span>
+                          <span className="font-semibold text-[#5A534B] dark:text-[#D4CEC7]">
+                            {editingRecipe.batchYieldQuantity} {editingRecipe.batchYieldUnit}
+                          </span>
+                        </div>
+                      </div>
+
+                      {!modalCost.costComplete && modalCost.uncostedIngredients.length > 0 && (
+                        <div className="text-[11px] text-[#8B7E74] dark:text-[#A39E93] pt-1">
+                          <span className="font-bold text-[#C97B63] dark:text-[#EAA89A]">Uncosted Items: </span>
+                          {modalCost.uncostedIngredients
+                            .map(
+                              (u) =>
+                                `${u.ingredientName} (${
+                                  u.reason === 'MISSING_DENSITY'
+                                    ? 'needs density'
+                                    : u.reason === 'UNLINKED'
+                                    ? 'not in pantry'
+                                    : 'no package price'
+                                })`
+                            )
+                            .join(', ')}
+                        </div>
+                      )}
                     </div>
                   );
                 })()}
@@ -1103,7 +1288,10 @@ export const RecipeManager: React.FC<RecipeManagerProps> = ({
                                 onBlur={() => setTimeout(() => setActiveSuggestionIdx(null), 200)}
                                 onChange={(e) => {
                                   setActiveSuggestionIdx(idx);
-                                  handleUpdateIngredient(idx, { name: e.target.value });
+                                  handleUpdateIngredient(idx, {
+                                    name: e.target.value,
+                                    masterIngredientId: undefined,
+                                  });
                                 }}
                                 className="w-full px-3 py-1.5 text-sm bg-white dark:bg-[#1E1B18] border border-[#EEECE8] dark:border-[#332F2B] rounded-lg focus:border-[#D4A373] focus:outline-none dark:text-[#EAE6E1] disabled:opacity-75"
                               />
@@ -1118,9 +1306,8 @@ export const RecipeManager: React.FC<RecipeManagerProps> = ({
                                       onMouseDown={(e) => {
                                         e.preventDefault();
                                         handleUpdateIngredient(idx, {
+                                          masterIngredientId: s.id,
                                           name: s.name,
-                                          unit: defaultUnit,
-                                          wastePercent: s.defaultWastePercent ?? ing.wastePercent ?? 0,
                                         });
                                         setActiveSuggestionIdx(null);
                                       }}
@@ -1164,7 +1351,7 @@ export const RecipeManager: React.FC<RecipeManagerProps> = ({
                                 disabled={!isEditorOrOwner}
                                 placeholder="Qty"
                                 value={
-                                  ing.quantity === '' ||
+                                  (ing.quantity as unknown as string) === '' ||
                                   ing.quantity === undefined ||
                                   ing.quantity === null ||
                                   isNaN(Number(ing.quantity))
@@ -1263,6 +1450,136 @@ export const RecipeManager: React.FC<RecipeManagerProps> = ({
                           />
                         </div>
                       </div>
+
+                      {/* Ingredient Cost & Link Status Indicator */}
+                      {(() => {
+                        const linkedMaster = ing.masterIngredientId
+                          ? masterIngredients.find((m) => m.id === ing.masterIngredientId)
+                          : null;
+                        const isBroken = Boolean(ing.masterIngredientId && !linkedMaster);
+                        const suggestion = !ing.masterIngredientId ? findMatchSuggestion(ing.name, masterIngredients) : null;
+                        const costRes = calculateIngredientCost(ing, linkedMaster || undefined);
+
+                        return (
+                          <div className="flex flex-wrap items-center justify-between text-[11px] pt-1.5 pl-6 gap-2 border-t border-[#EEECE8]/60 dark:border-[#332F2B]/60">
+                            <div className="flex flex-wrap items-center gap-2">
+                              {/* Linking Status Badge & Actions */}
+                              {isBroken ? (
+                                <div className="flex items-center gap-1.5">
+                                  <span className="inline-flex items-center gap-1 font-bold text-rose-700 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/60 px-2 py-0.5 rounded-full">
+                                    <AlertTriangle className="w-3 h-3" />
+                                    BROKEN LINK / MASTER INGREDIENT NOT FOUND
+                                  </span>
+                                  {isEditorOrOwner && (
+                                    <button
+                                      type="button"
+                                      onClick={() => setLinkModalIdx(idx)}
+                                      className="text-amber-600 hover:text-amber-700 font-semibold cursor-pointer underline ml-1"
+                                    >
+                                      Repair Link
+                                    </button>
+                                  )}
+                                  {isEditorOrOwner && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleUpdateIngredient(idx, { masterIngredientId: undefined })}
+                                      className="text-rose-600 hover:text-rose-700 font-semibold cursor-pointer underline ml-1"
+                                    >
+                                      Remove
+                                    </button>
+                                  )}
+                                </div>
+                              ) : linkedMaster ? (
+                                <div className="flex items-center gap-1.5">
+                                  <span className="inline-flex items-center gap-1 text-[#2D6A4F] dark:text-[#52B788] bg-emerald-50 dark:bg-emerald-950/40 px-2 py-0.5 rounded-full font-semibold">
+                                    <CheckCircle2 className="w-3 h-3 shrink-0" />
+                                    <span>Linked: {linkedMaster.name} ✓</span>
+                                  </span>
+                                  {isEditorOrOwner && (
+                                    <button
+                                      type="button"
+                                      onClick={() => setLinkModalIdx(idx)}
+                                      className="text-amber-600 hover:text-amber-700 font-medium cursor-pointer hover:underline text-[10px]"
+                                    >
+                                      Change
+                                    </button>
+                                  )}
+                                  {isEditorOrOwner && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleUpdateIngredient(idx, { masterIngredientId: undefined })}
+                                      className="text-stone-400 hover:text-stone-600 font-medium cursor-pointer hover:underline text-[10px]"
+                                    >
+                                      Unlink
+                                    </button>
+                                  )}
+                                </div>
+                              ) : (
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="text-[#8B7E74] dark:text-[#A39E93] bg-[#EEECE8]/60 dark:bg-[#332F2B]/60 px-2 py-0.5 rounded-full">
+                                    Not Linked
+                                  </span>
+                                  {suggestion && (
+                                    <div className="flex items-center gap-1 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900/60 px-2 py-0.5 rounded-full">
+                                      <span className="text-amber-800 dark:text-amber-300 font-medium">
+                                        Suggested: {suggestion.masterIngredient.name} ({suggestion.confidence === 'exact' ? 'Exact Match' : 'Likely Match'})
+                                      </span>
+                                      {isEditorOrOwner && (
+                                        <button
+                                          type="button"
+                                          onClick={() => handleUpdateIngredient(idx, { masterIngredientId: suggestion.masterIngredient.id })}
+                                          className="text-amber-700 dark:text-amber-400 font-bold hover:underline ml-1 cursor-pointer"
+                                        >
+                                          Confirm Link
+                                        </button>
+                                      )}
+                                    </div>
+                                  )}
+                                  {isEditorOrOwner && (
+                                    <button
+                                      type="button"
+                                      onClick={() => setLinkModalIdx(idx)}
+                                      className="text-amber-600 dark:text-amber-400 font-bold hover:underline cursor-pointer flex items-center gap-1 ml-1"
+                                    >
+                                      <Link2 className="w-3 h-3" />
+                                      <span>Link Ingredient</span>
+                                    </button>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+
+                            <div className="font-mono font-bold">
+                              {costRes.isComplete && costRes.cost !== undefined ? (
+                                <span className="text-[#2D6A4F] dark:text-[#52B788]">
+                                  ${costRes.cost.toFixed(2)}{' '}
+                                  <span className="font-normal text-[10px] text-[#8B7E74]">
+                                    (
+                                    {costRes.unitCostType === 'per_gram' && costRes.unitCostUsed !== undefined
+                                      ? `$${
+                                          costRes.unitCostUsed < 0.01
+                                            ? costRes.unitCostUsed.toFixed(6)
+                                            : costRes.unitCostUsed.toFixed(4)
+                                        }/g`
+                                      : `$${costRes.unitCostUsed?.toFixed(2)}/ea`}
+                                    )
+                                  </span>
+                                </span>
+                              ) : (
+                                <span className="text-[#8B7E74] dark:text-[#A39E93] text-[10px]">
+                                  {costRes.reason === 'UNLINKED'
+                                    ? 'Uncosted'
+                                    : costRes.reason === 'MISSING_DENSITY'
+                                    ? '⚠️ Missing liquid density'
+                                    : costRes.reason === 'NO_PURCHASE_PRICE'
+                                    ? 'No package cost recorded'
+                                    : 'Cost pending'}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })()}
                     </div>
                   );
                 })}
@@ -1454,6 +1771,27 @@ export const RecipeManager: React.FC<RecipeManagerProps> = ({
             </form>
           </div>
         </div>
+      )}
+
+      {/* Ingredient Link Selector Modal */}
+      {editingRecipe && linkModalIdx !== null && editingRecipe.ingredients[linkModalIdx] && (
+        <IngredientLinkSelectorModal
+          isOpen={linkModalIdx !== null}
+          onClose={() => setLinkModalIdx(null)}
+          recipeName={editingRecipe.name || 'Untitled Recipe'}
+          ingredientName={editingRecipe.ingredients[linkModalIdx].name}
+          currentMasterIngredientId={editingRecipe.ingredients[linkModalIdx].masterIngredientId}
+          masterIngredients={masterIngredients}
+          userRole={userRole}
+          onConfirmLink={(masterId) => {
+            handleUpdateIngredient(linkModalIdx, { masterIngredientId: masterId });
+            setLinkModalIdx(null);
+          }}
+          onUnlink={() => {
+            handleUpdateIngredient(linkModalIdx, { masterIngredientId: undefined });
+            setLinkModalIdx(null);
+          }}
+        />
       )}
     </div>
   );

@@ -1,24 +1,33 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   History,
   Search,
   FileText,
-  Copy,
   Trash2,
   Calendar,
   AlertTriangle,
-  Scale,
-  CheckCircle2,
+  Check,
   Eye,
   X,
 } from 'lucide-react';
-import { ProductionHistoryEntry } from '../types';
+import { AccessRole, ProductionHistoryEntry, ProductionPreset, Recipe } from '../types';
 import { formatNumber, isButterIngredient, isPeanutButterIngredient, getDisplayDecimals } from '../utils/units';
 import { exportProductionSheetPDF } from '../utils/pdfExport';
 import { store } from '../services/store';
+import {
+  FirestoreHydrationState,
+  resolveApplicableSafetyInstructions,
+  isSafetySignatureAcknowledged,
+  canProceedToMixWithSyncSafety,
+  resolveSafetyOperationalGateState,
+  SAFETY_HYDRATION_LOADING_MESSAGE,
+  SAFETY_HYDRATION_ERROR_MESSAGE,
+  SAFETY_CONNECTION_UNVERIFIED_MESSAGE,
+} from '../utils/productionNotes';
 
 interface HistoryViewProps {
   history: ProductionHistoryEntry[];
+  userRole?: AccessRole | null;
   onDeleteHistoryEntry: (id: string) => void;
   onReopenInCalculator: (entry: ProductionHistoryEntry) => void;
   businessName?: string;
@@ -27,14 +36,144 @@ interface HistoryViewProps {
 
 export const HistoryView: React.FC<HistoryViewProps> = ({
   history,
+  userRole,
   onDeleteHistoryEntry,
-  onReopenInCalculator,
   businessName,
   decimalPlaces,
 }) => {
+  const effectiveRole = userRole !== undefined ? userRole : store.getUserRole();
+  const isEditorOrOwner = effectiveRole === 'owner' || effectiveRole === 'editor';
   const decimals = decimalPlaces !== undefined ? decimalPlaces : 2;
   const [searchTerm, setSearchTerm] = useState('');
   const [viewingEntry, setViewingEntry] = useState<ProductionHistoryEntry | null>(null);
+  const [acknowledgedSignature, setAcknowledgedSignature] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  const [recipes, setRecipes] = useState<Recipe[]>(() => store.getRecipes(true));
+  const [presets, setPresets] = useState<ProductionPreset[]>(() => store.getPresets());
+  const [recipesHydrationState, setRecipesHydrationState] = useState<FirestoreHydrationState>(() =>
+    store.getRecipesHydrationState()
+  );
+  const [presetsHydrationState, setPresetsHydrationState] = useState<FirestoreHydrationState>(() =>
+    store.getPresetsHydrationState()
+  );
+  const [syncError, setSyncError] = useState<string | null>(() =>
+    store.getCriticalNotesSyncError()
+  );
+  const [connectionVerified, setConnectionVerified] = useState<boolean>(() =>
+    store.isSafetyConnectionVerified()
+  );
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState<string>(() =>
+    store.getActiveWorkspaceId()
+  );
+
+  useEffect(() => {
+    const unsub = store.subscribe(() => {
+      setRecipes(store.getRecipes(true));
+      setPresets(store.getPresets());
+      setRecipesHydrationState(store.getRecipesHydrationState());
+      setPresetsHydrationState(store.getPresetsHydrationState());
+      setSyncError(store.getCriticalNotesSyncError());
+      setConnectionVerified(store.isSafetyConnectionVerified());
+      setActiveWorkspaceId(store.getActiveWorkspaceId());
+    });
+    return unsub;
+  }, []);
+
+  const operationalGateState = useMemo(
+    () =>
+      resolveSafetyOperationalGateState({
+        recipesHydrationState,
+        presetsHydrationState,
+        syncError,
+        connectionVerified,
+      }),
+    [recipesHydrationState, presetsHydrationState, syncError, connectionVerified]
+  );
+
+  const resolveEntrySafety = (entry: ProductionHistoryEntry | null) => {
+    if (!entry) return null;
+    const matchedRecipe =
+      recipes.find((r) => r.id === entry.recipeId) ||
+      ({
+        id: entry.recipeId,
+        name: entry.recipeName,
+        workspaceId: entry.workspaceId || activeWorkspaceId,
+      } as Recipe);
+    const presetIds = (entry.requirements || [])
+      .map((r) => (r.presetId || '').trim())
+      .filter(Boolean);
+    return resolveApplicableSafetyInstructions({
+      recipe: matchedRecipe,
+      presets,
+      selectedPresetIds: presetIds,
+      activeWorkspaceId: entry.workspaceId || activeWorkspaceId,
+    });
+  };
+
+  const viewingSafety = useMemo(
+    () => resolveEntrySafety(viewingEntry),
+    [viewingEntry, recipes, presets, activeWorkspaceId]
+  );
+
+  const isViewingAcknowledged = useMemo(
+    () =>
+      viewingSafety
+        ? isSafetySignatureAcknowledged(viewingSafety.signature, acknowledgedSignature)
+        : true,
+    [viewingSafety, acknowledgedSignature]
+  );
+
+  const canExportViewingEntry = useMemo(
+    () =>
+      Boolean(viewingEntry) &&
+      canProceedToMixWithSyncSafety({
+        hasNotes: Boolean(viewingSafety?.hasSafetyNotes),
+        isAcknowledged: isViewingAcknowledged,
+        syncError,
+        recipesHydrationState,
+        presetsHydrationState,
+        connectionVerified,
+      }),
+    [
+      viewingEntry,
+      viewingSafety?.hasSafetyNotes,
+      isViewingAcknowledged,
+      syncError,
+      recipesHydrationState,
+      presetsHydrationState,
+      connectionVerified,
+    ]
+  );
+
+  const handleExportEntry = (entry: ProductionHistoryEntry, ackSig: string | null) => {
+    try {
+      setExportError(null);
+      const branding = store.getWorkspaceBranding();
+      exportProductionSheetPDF(
+        entry,
+        {
+          displayName: branding.displayName || businessName,
+          paletteId: branding.paletteId,
+        },
+        decimals,
+        {
+          recipes,
+          presets,
+          activeWorkspaceId: entry.workspaceId || activeWorkspaceId,
+          recipesHydrationState,
+          presetsHydrationState,
+          syncError,
+          connectionVerified,
+          acknowledgedSafetySignature: ackSig,
+        }
+      );
+    } catch (err: unknown) {
+      setExportError(
+        err instanceof Error ? err.message : 'Unable to export production sheet PDF.'
+      );
+    }
+  };
 
   const filtered = history.filter(
     (h) =>
@@ -56,6 +195,25 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
           </p>
         </div>
       </div>
+
+      {exportError && (
+        <div
+          id="history-export-error-banner"
+          className="px-4 py-3 rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-300 dark:border-rose-800 text-xs font-bold text-rose-900 dark:text-rose-200 flex items-center justify-between gap-3"
+        >
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+            <span>{exportError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setExportError(null)}
+            className="p-1 rounded hover:bg-rose-100 cursor-pointer"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
 
       {/* Search Bar */}
       <div className="relative w-full sm:w-80">
@@ -122,7 +280,11 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
             <div className="flex items-center justify-between pt-3 border-t border-[#EEECE8] dark:border-[#332F2B]">
               <button
                 id={`history-view-btn-${entry.id}`}
-                onClick={() => setViewingEntry(entry)}
+                onClick={() => {
+                  setExportError(null);
+                  setAcknowledgedSignature(null);
+                  setViewingEntry(entry);
+                }}
                 className="inline-flex items-center gap-1 bg-[#D4A373] hover:bg-[#C49363] text-white font-bold text-xs px-3 py-1.5 rounded-lg transition cursor-pointer"
               >
                 <Eye className="w-3.5 h-3.5" />
@@ -132,34 +294,41 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
               <div className="flex items-center gap-1">
                 <button
                   id={`history-export-btn-${entry.id}`}
+                  disabled={operationalGateState !== 'READY'}
                   onClick={() => {
-                    const branding = store.getWorkspaceBranding();
-                    exportProductionSheetPDF(
-                      entry,
-                      {
-                        displayName: branding.displayName || businessName,
-                        paletteId: branding.paletteId,
-                      },
-                      decimals
-                    );
+                    if (operationalGateState !== 'READY') return;
+                    const entrySafety = resolveEntrySafety(entry);
+                    if (entrySafety?.hasSafetyNotes) {
+                      setExportError(null);
+                      setAcknowledgedSignature(null);
+                      setViewingEntry(entry);
+                      return;
+                    }
+                    handleExportEntry(entry, null);
                   }}
-                  title="Export PDF"
-                  className="p-1.5 text-[#8B7E74] hover:text-[#5A534B] hover:bg-[#F5F2ED] dark:hover:bg-[#25221F] rounded-lg transition cursor-pointer"
+                  title={
+                    operationalGateState !== 'READY'
+                      ? 'Safety sync must be verified before exporting PDF'
+                      : 'Export PDF'
+                  }
+                  className="p-1.5 text-[#8B7E74] hover:text-[#5A534B] hover:bg-[#F5F2ED] dark:hover:bg-[#25221F] rounded-lg transition cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   <FileText className="w-4 h-4" />
                 </button>
-                <button
-                  id={`history-delete-btn-${entry.id}`}
-                  onClick={() => {
-                    if (confirm('Delete this history record?')) {
-                      onDeleteHistoryEntry(entry.id);
-                    }
-                  }}
-                  title="Delete Record"
-                  className="p-1.5 text-[#C97B63] hover:text-red-700 hover:bg-[#FDF2F0] dark:hover:bg-[#2C1916] rounded-lg transition cursor-pointer"
-                >
-                  <Trash2 className="w-4 h-4" />
-                </button>
+                {isEditorOrOwner && (
+                  <button
+                    id={`history-delete-btn-${entry.id}`}
+                    onClick={() => {
+                      if (confirm('Delete this history record?')) {
+                        onDeleteHistoryEntry(entry.id);
+                      }
+                    }}
+                    title="Delete Record"
+                    className="p-1.5 text-[#C97B63] hover:text-red-700 hover:bg-[#FDF2F0] dark:hover:bg-[#2C1916] rounded-lg transition cursor-pointer"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                )}
               </div>
             </div>
           </div>
@@ -194,6 +363,64 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
             </div>
 
             <div className="p-6 overflow-y-auto space-y-5">
+              {operationalGateState !== 'READY' && (
+                <div
+                  id="history-modal-safety-hold-banner"
+                  className="p-3.5 rounded-xl border border-amber-400 bg-amber-50 dark:bg-amber-950/40 text-xs font-bold text-amber-950 dark:text-amber-100"
+                >
+                  {operationalGateState === 'INITIAL_LOADING'
+                    ? SAFETY_HYDRATION_LOADING_MESSAGE
+                    : operationalGateState === 'CONNECTION_UNVERIFIED'
+                    ? SAFETY_CONNECTION_UNVERIFIED_MESSAGE
+                    : SAFETY_HYDRATION_ERROR_MESSAGE}
+                </div>
+              )}
+
+              {viewingSafety?.hasSafetyNotes && (
+                <div
+                  id="history-critical-notes-card"
+                  className={`rounded-xl border-2 p-4 text-xs space-y-3 ${
+                    isViewingAcknowledged
+                      ? 'border-emerald-500 bg-emerald-50/70 dark:bg-emerald-950/30'
+                      : 'border-amber-500 bg-amber-50 dark:bg-amber-950/40'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 font-black uppercase tracking-wider text-amber-950 dark:text-amber-100">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                    <span>Critical Production Notes</span>
+                  </div>
+                  <div className="space-y-2 p-3 rounded-xl bg-white dark:bg-[#1E1B18] border border-amber-200 dark:border-amber-900/60">
+                    {viewingSafety.allInstructions.map((item) => (
+                      <div key={item.id} className="space-y-1">
+                        <span className="inline-block px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider bg-amber-100 dark:bg-amber-950 text-amber-950 dark:text-amber-200 border border-amber-300 dark:border-amber-700">
+                          {item.scope === 'preset_specific' && item.presetName
+                            ? `Preset-Specific Critical Note — ${item.presetName}`
+                            : item.scopeLabel}
+                        </span>
+                        <div className="font-semibold text-amber-950 dark:text-amber-100 whitespace-pre-wrap break-words">
+                          {item.note}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  {!isViewingAcknowledged && (
+                    <button
+                      id="btn-history-acknowledge-notes"
+                      type="button"
+                      disabled={operationalGateState !== 'READY'}
+                      onClick={() => {
+                        if (operationalGateState !== 'READY' || !viewingSafety.signature) return;
+                        setAcknowledgedSignature(viewingSafety.signature);
+                      }}
+                      className="w-full py-2.5 px-4 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-black text-xs flex items-center justify-center gap-2 cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed"
+                    >
+                      <Check className="w-4 h-4 stroke-[3]" />
+                      <span>I HAVE READ THESE PRODUCTION NOTES</span>
+                    </button>
+                  )}
+                </div>
+              )}
+
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                 <div className="bg-[#F9F8F6] dark:bg-[#25221F] p-3 rounded-xl border border-[#EEECE8] dark:border-[#332F2B]">
                   <span className="text-[10px] text-[#8B7E74] uppercase font-semibold">Total Pieces</span>
@@ -289,18 +516,13 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
 
             <div className="p-4 border-t border-[#EEECE8] dark:border-[#332F2B] flex items-center justify-between bg-[#F9F8F6] dark:bg-[#25221F]">
               <button
+                id="history-modal-export-pdf-btn"
+                disabled={!canExportViewingEntry}
                 onClick={() => {
-                  const branding = store.getWorkspaceBranding();
-                  exportProductionSheetPDF(
-                    viewingEntry,
-                    {
-                      displayName: branding.displayName || businessName,
-                      paletteId: branding.paletteId,
-                    },
-                    decimals
-                  );
+                  if (!viewingEntry || !canExportViewingEntry) return;
+                  handleExportEntry(viewingEntry, acknowledgedSignature);
                 }}
-                className="inline-flex items-center gap-1.5 bg-[#5A534B] hover:bg-[#47413A] dark:bg-[#3D3732] text-white font-bold px-4 py-2 rounded-xl text-xs transition cursor-pointer"
+                className="inline-flex items-center gap-1.5 bg-[#5A534B] hover:bg-[#47413A] dark:bg-[#3D3732] text-white font-bold px-4 py-2 rounded-xl text-xs transition cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 <FileText className="w-3.5 h-3.5" />
                 <span>Export PDF Sheet</span>

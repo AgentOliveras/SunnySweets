@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import {
   ChefHat,
   Scale,
@@ -10,32 +10,35 @@ import {
   ArrowRight,
 } from 'lucide-react';
 import { signInWithGoogle } from '../services/firebase';
+import { AuthErrorDiagnostic, formatGoogleSignInError } from '../utils/authDiagnostics';
 
 interface SignInScreenProps {
   onSignInSuccess?: () => void;
 }
 
 export const SignInScreen: React.FC<SignInScreenProps> = ({ onSignInSuccess }) => {
+  const [activeTab, setActiveTab] = useState<'signin' | 'signup'>('signin');
   const [isLoading, setIsLoading] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [authError, setAuthError] = useState<AuthErrorDiagnostic | null>(null);
+  const authInFlightRef = useRef(false);
 
-  const handleSignIn = async () => {
+  const handleAuth = async () => {
+    if (authInFlightRef.current || isLoading) {
+      return;
+    }
+    authInFlightRef.current = true;
     try {
       setIsLoading(true);
-      setErrorMessage(null);
+      setAuthError(null);
       const user = await signInWithGoogle();
       if (user && onSignInSuccess) {
         onSignInSuccess();
       }
-    } catch (err: any) {
-      console.error('Sign-in failure:', err);
-      // Suppress standard popup-closed error or display friendly message
-      if (err.code === 'auth/popup-closed-by-user') {
-        setErrorMessage('Sign-in window was closed. Please try again.');
-      } else {
-        setErrorMessage(err.message || 'Authentication failed. Please verify your connection.');
-      }
+    } catch (err: unknown) {
+      console.error('Authentication failure:', err);
+      setAuthError(formatGoogleSignInError(err));
     } finally {
+      authInFlightRef.current = false;
       setIsLoading(false);
     }
   };
@@ -50,23 +53,57 @@ export const SignInScreen: React.FC<SignInScreenProps> = ({ onSignInSuccess }) =
           </div>
           <div>
             <div className="text-sm font-bold text-[#5A534B] dark:text-[#EAE6E1] tracking-tight leading-tight">
-              Sunny Sweets
+              Commercial Bakery
             </div>
             <div className="text-[10px] uppercase font-semibold tracking-wider text-[#8B7E74] dark:text-[#A39E93] leading-tight">
-              Commercial Bakery
+              Recipe & Scaling Platform
             </div>
           </div>
         </div>
 
         <div className="flex items-center gap-2 text-xs font-semibold text-[#8B7E74] dark:text-[#A39E93]">
           <ShieldCheck className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-          <span className="hidden sm:inline">Enterprise Access Control</span>
+          <span className="hidden sm:inline">Enterprise Tenant Security</span>
         </div>
       </header>
 
       {/* Main Authentication Card */}
       <main className="w-full max-w-md mx-auto my-auto py-8">
         <div className="bg-white dark:bg-[#1C1A18] rounded-3xl shadow-xl border border-[#E5E1DA] dark:border-[#2D2925] p-6 sm:p-8 space-y-6">
+          {/* Customer Path Segmented Control */}
+          <div className="flex rounded-xl bg-[#F5F2ED] dark:bg-[#25221F] p-1 border border-[#EEECE8] dark:border-[#332F2B]">
+            <button
+              id="tab-signin"
+              type="button"
+              onClick={() => {
+                setActiveTab('signin');
+                setAuthError(null);
+              }}
+              className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all cursor-pointer ${
+                activeTab === 'signin'
+                  ? 'bg-white dark:bg-[#1C1A18] text-[#5A534B] dark:text-[#EAE6E1] shadow-xs'
+                  : 'text-[#8B7E74] dark:text-[#A39E93] hover:text-[#5A534B]'
+              }`}
+            >
+              Sign In
+            </button>
+            <button
+              id="tab-signup"
+              type="button"
+              onClick={() => {
+                setActiveTab('signup');
+                setAuthError(null);
+              }}
+              className={`flex-1 py-2 text-xs font-bold rounded-lg transition-all cursor-pointer ${
+                activeTab === 'signup'
+                  ? 'bg-white dark:bg-[#1C1A18] text-[#5A534B] dark:text-[#EAE6E1] shadow-xs'
+                  : 'text-[#8B7E74] dark:text-[#A39E93] hover:text-[#5A534B]'
+              }`}
+            >
+              Create Account / Start Free Trial
+            </button>
+          </div>
+
           {/* Card Header */}
           <div className="text-center space-y-3">
             <div className="inline-flex p-3 rounded-2xl bg-[#F5F2ED] dark:bg-[#25221F] text-[#D4A373] ring-8 ring-[#F5F2ED]/60 dark:ring-[#25221F]/40">
@@ -74,28 +111,50 @@ export const SignInScreen: React.FC<SignInScreenProps> = ({ onSignInSuccess }) =
             </div>
             <div className="space-y-1.5">
               <h1 className="text-2xl font-bold text-[#5A534B] dark:text-[#EAE6E1] tracking-tight">
-                Recipe & Production Platform
+                {activeTab === 'signup'
+                  ? 'Start 14-Day Free Trial'
+                  : 'Recipe & Production Platform'}
               </h1>
               <p className="text-xs sm:text-sm text-[#8B7E74] dark:text-[#A39E93] leading-relaxed">
-                Proprietary commercial batch formulation, unit scaling, and guided mixing controls.
+                {activeTab === 'signup'
+                  ? 'Set up a dedicated workspace for your bakery, catering team, or commercial kitchen.'
+                  : 'Sign in to access your team recipes, batch scaling, and guided mixing controls.'}
               </p>
             </div>
           </div>
 
           {/* Error Banner */}
-          {errorMessage && (
-            <div className="p-3.5 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/40 flex items-start gap-2.5 text-xs text-red-700 dark:text-red-300">
+          {authError && (
+            <div
+              id="google-auth-error-banner"
+              role="alert"
+              className="p-3.5 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/40 flex items-start gap-2.5 text-xs text-red-800 dark:text-red-300"
+            >
               <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-red-500" />
-              <span className="leading-relaxed">{errorMessage}</span>
+              <div className="space-y-1.5 min-w-0">
+                <div className="font-bold leading-snug">{authError.title}</div>
+                <p className="leading-relaxed text-red-700 dark:text-red-300/90">{authError.message}</p>
+                {authError.tabletHint && (
+                  <p className="text-[11px] leading-relaxed text-red-700/80 dark:text-red-300/80">
+                    {authError.tabletHint}
+                  </p>
+                )}
+                <div
+                  id="google-auth-error-code"
+                  className="pt-0.5 font-mono text-[11px] font-semibold text-red-900 dark:text-red-200"
+                >
+                  Diagnostic code: {authError.code}
+                </div>
+              </div>
             </div>
           )}
 
-          {/* Sign In Action */}
+          {/* Action Button */}
           <div className="space-y-3 pt-2">
             <button
-              id="google-signin-button"
+              id="google-auth-button"
               type="button"
-              onClick={handleSignIn}
+              onClick={handleAuth}
               disabled={isLoading}
               className="w-full flex items-center justify-center gap-3 px-5 py-3.5 rounded-xl text-sm font-bold text-white bg-[#5A534B] hover:bg-[#48423B] dark:bg-[#3D3732] dark:hover:bg-[#4E4741] disabled:opacity-50 transition shadow-sm cursor-pointer group"
             >
@@ -121,12 +180,20 @@ export const SignInScreen: React.FC<SignInScreenProps> = ({ onSignInSuccess }) =
                   />
                 </svg>
               )}
-              <span>{isLoading ? 'Verifying with Google...' : 'Sign in with Google'}</span>
+              <span>
+                {isLoading
+                  ? 'Connecting with Google...'
+                  : activeTab === 'signup'
+                  ? 'Continue with Google to Start Trial'
+                  : 'Sign in with Google'}
+              </span>
               <ArrowRight className="w-4 h-4 text-[#D4A373] group-hover:translate-x-0.5 transition-transform" />
             </button>
 
             <p className="text-center text-[11px] text-[#8B7E74] dark:text-[#A39E93]">
-              Authorized bakery personnel only. Use your registered Google account.
+              {activeTab === 'signup'
+                ? 'No credit card required. A new workspace will be created for your team.'
+                : 'Authorized bakery personnel. Use your registered Google account.'}
             </p>
           </div>
 
@@ -155,7 +222,7 @@ export const SignInScreen: React.FC<SignInScreenProps> = ({ onSignInSuccess }) =
 
       {/* Footer */}
       <footer className="w-full max-w-5xl mx-auto text-center py-4 text-xs text-[#8B7E74] dark:text-[#A39E93] space-y-1">
-        <div>Sunny Sweets Commercial Platform • Proprietary & Confidential</div>
+        <div>Commercial Bakery Platform • Isolated Commercial Tenant Architecture</div>
         <div className="text-[10px] text-[#8B7E74]/70 dark:text-[#A39E93]/70">
           Commercial subscriptions and team workspace management powered by Google Cloud & Firebase.
         </div>

@@ -32,9 +32,13 @@ import {
   FolderPlus,
   SlidersHorizontal,
   AlertTriangle,
+  Lock,
+  ChefHat,
 } from 'lucide-react';
-import { UserSettings, WeightUnit, Recipe, ProductionPreset } from '../types';
-import { WEIGHT_UNITS } from '../utils/units';
+import { UserSettings, WeightUnit, Recipe, ProductionPreset, AccessRole } from '../types';
+import { WEIGHT_UNITS, PRODUCTION_DISPLAY_MODES } from '../utils/units';
+import { getTargetPresetCategoriesForRecipeCategory } from '../utils/categoryPresetMapping';
+import { normalizePresetCategory } from '../utils/calculator';
 import { store } from '../services/store';
 import { auth, signInWithGoogle } from '../services/firebase';
 import {
@@ -45,17 +49,30 @@ import {
 } from '../services/migration';
 import { BrandingSettings } from './BrandingSettings';
 import { MembersManagement } from './MembersManagement';
+import { SubscriptionSettings } from './SubscriptionSettings';
 import { SettingsSectionErrorBoundary } from './SettingsSectionErrorBoundary';
+import { ManagementLockSettings } from './ManagementLockSettings';
+import { WorkspaceCapabilitiesSettings } from './WorkspaceCapabilitiesSettings';
+import { Stage1MigrationCard } from './Stage1MigrationCard';
+import { Stage2MigrationCard } from './Stage2MigrationCard';
+import { CollapsibleSettingsSection } from './CollapsibleSettingsSection';
+import { ProductionOptionOrderingSettings } from './ProductionOptionOrderingSettings';
+import { CriticalNotesSyncReview } from './CriticalNotesSyncReview';
+
+import { ManagementLockConfig } from '../utils/managementLock';
 
 interface SettingsViewProps {
   settings: UserSettings;
+  categoryPresetMap?: Record<string, string | string[]>;
+  productionOptionOrder?: string[] | null;
+  userRole?: AccessRole | null;
   recipesCount?: number;
   recipes?: Recipe[];
   presets?: ProductionPreset[];
   onUpdateSettings: (updates: Partial<UserSettings>) => void;
-  onStandardizeAllRecipes?: (targetUnit: WeightUnit) => Promise<number>;
   onOpenUnitTests: () => void;
   testPassedCount?: number;
+  onManagementLockConfigured?: (config: ManagementLockConfig) => void;
 }
 
 const RECIPE_CATEGORY_ICONS: Record<string, string> = {
@@ -86,20 +103,21 @@ const PRESET_CATEGORY_ICONS: Record<string, string> = {
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
   settings,
+  categoryPresetMap,
+  productionOptionOrder,
+  userRole: userRoleProp,
   recipesCount = 0,
   recipes,
   presets,
   onUpdateSettings,
-  onStandardizeAllRecipes,
   onOpenUnitTests,
   testPassedCount,
+  onManagementLockConfigured,
 }) => {
   const [businessName, setBusinessName] = useState(settings?.businessName || 'Artisan Bakery Co.');
   const [defaultWastePercent, setDefaultWastePercent] = useState<string | number>(
     settings?.defaultWastePercent !== undefined ? settings.defaultWastePercent : 6
   );
-  const [standardizeStatus, setStandardizeStatus] = useState<string | null>(null);
-  const [isStandardizing, setIsStandardizing] = useState(false);
   const [saveFeedback, setSaveFeedback] = useState<string | null>(null);
   const [syncStatus, setSyncStatus] = useState(store.getSyncStatus());
   const [isManualSyncing, setIsManualSyncing] = useState(false);
@@ -122,18 +140,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [migrationConfirmOpen, setMigrationConfirmOpen] = useState(false);
 
   const handleScanMigration = async () => {
+    if (store.getUserRole() !== 'owner') {
+      showNotification('Permission denied: Only workspace owners can scan or run Phase 0 migrations.');
+      return;
+    }
     setIsScanning(true);
     try {
       const rep = await scanForLegacyData();
       setScanReport(rep);
-    } catch (err) {
-      console.warn('Scan notice:', err);
+    } catch (err: any) {
+      showNotification(err?.message || 'Database scan failed.');
     } finally {
       setIsScanning(false);
     }
   };
 
   const handleExecuteMigration = async () => {
+    if (store.getUserRole() !== 'owner') {
+      setMigrationConfirmOpen(false);
+      showNotification('Permission denied: Only workspace owners can execute Phase 0 migrations.');
+      return;
+    }
     setIsMigrating(true);
     try {
       const res = await executePhase0Migration();
@@ -141,8 +168,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setMigrationConfirmOpen(false);
       const rep = await scanForLegacyData();
       setScanReport(rep);
-    } catch (err) {
-      console.warn('Migration error:', err);
+    } catch (err: any) {
+      showNotification(err?.message || 'Phase 0 migration failed.');
     } finally {
       setIsMigrating(false);
     }
@@ -161,24 +188,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const allPresetCategories = useMemo(() => {
     const set = new Set<string>(['Cookies', 'Pie Dough', 'Base Dough', 'Shortbread']);
     allPresetsList.forEach((p) => {
-      if (p.category && p.category.trim()) {
-        set.add(p.category.trim());
-      }
+      set.add(normalizePresetCategory(p));
     });
     return Array.from(set);
   }, [allPresetsList]);
 
-  // Count presets per preset category
+  // Count presets per preset category (normalized)
   const presetCounts = useMemo(() => {
     const counts: Record<string, number> = {};
     allPresetsList.forEach((p) => {
-      const cat = p.category || 'Cookies';
+      const cat = normalizePresetCategory(p);
       counts[cat] = (counts[cat] || 0) + 1;
     });
     return counts;
   }, [allPresetsList]);
 
-  // Derive ONLY the categories that actually exist in the system (from existing recipes or user-managed categories)
+  // Derive ONLY the categories that exist in the active workspace (from workspace recipes or workspace-managed categories)
   const allRecipeCategories = useMemo(() => {
     const set = new Set<string>();
     allRecipes.forEach((r) => {
@@ -187,15 +212,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       }
     });
 
-    if (settings?.recipeCategories && settings.recipeCategories.length > 0) {
-      settings.recipeCategories.forEach((c) => {
-        if (c && c.trim()) set.add(c.trim());
-      });
-    }
+    store.getRecipeCategories().forEach((c) => {
+      if (c && c.trim()) set.add(c.trim());
+    });
 
-    const categoriesArray = Array.from(set);
-    return categoriesArray;
-  }, [allRecipes, settings?.recipeCategories, syncStatus]);
+    return Array.from(set);
+  }, [allRecipes, categoryPresetMap, syncStatus]);
 
   // Filtered recipe categories for search
   const filteredRecipeCategories = useMemo(() => {
@@ -239,18 +261,110 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }, 3500);
   };
 
-  const handleStandardize = async (unit: WeightUnit) => {
-    if (!onStandardizeAllRecipes) return;
-    setIsStandardizing(true);
-    try {
-      const count = await onStandardizeAllRecipes(unit);
-      setStandardizeStatus(`Successfully standardized ${count} ingredient inputs across all recipes into ${unit.toUpperCase()}!`);
-      setTimeout(() => setStandardizeStatus(null), 5000);
-    } catch (err) {
-      console.error('Failed to standardize recipes:', err);
-    } finally {
-      setIsStandardizing(false);
+  const isProductionFloorEnabled =
+    settings?.productionFloorModeEnabled !== undefined
+      ? settings.productionFloorModeEnabled !== false
+      : store.isProductionFloorModeEnabled();
+
+  const userRole = userRoleProp ?? store.getUserRole();
+  const isOwnerRole = userRole === 'owner';
+  const isViewerRole = userRole === 'viewer';
+
+  const authoritativeCategoryPresetMap = useMemo(() => {
+    return categoryPresetMap ?? store.getCategoryPresetMap();
+  }, [categoryPresetMap, syncStatus]);
+
+  const pendingCategoryMigration = useMemo(() => {
+    if (!isOwnerRole) return null;
+    return store.inspectPendingCategoryMappingMigration();
+  }, [isOwnerRole, authoritativeCategoryPresetMap, settings?.categoryPresetMap, syncStatus]);
+
+  const pendingProdOrderMigration = useMemo(() => {
+    if (!isOwnerRole) return null;
+    return store.inspectPendingProductionOrderMigration();
+  }, [isOwnerRole, productionOptionOrder, settings?.productionOptionOrder, allPresetsList, syncStatus]);
+
+  const [isApplyingCategoryMigration, setIsApplyingCategoryMigration] = useState(false);
+
+  const handleToggleProductionFloor = async (enabled: boolean) => {
+    if (!isOwnerRole) {
+      showNotification('Permission denied: Only workspace owners can enable or disable Production Floor Mode.');
+      return;
     }
+    try {
+      await store.setProductionFloorModeEnabled(enabled);
+      showNotification(
+        enabled ? 'Production Floor Mode enabled' : 'Production Floor Mode disabled'
+      );
+    } catch (err: any) {
+      showNotification(err?.message || 'Failed to update Production Floor setting');
+    }
+  };
+
+  // Collapsible Settings Accordion State (Phase 2B.1: ALL sections default to collapsed)
+  const [openSections, setOpenSections] = useState<Record<string, boolean>>({
+    production_ordering: false,
+    measurement: false,
+    precision: false,
+    categories: false,
+    production_floor: false,
+    branding: false,
+    members: false,
+    subscription: false,
+    profile: false,
+    cloud: false,
+    security: false,
+    migrations: false,
+    capabilities: false,
+    lock: false,
+    system: false,
+  });
+
+  const toggleSection = (key: string) => {
+    setOpenSections((prev) => ({
+      ...prev,
+      [key]: !prev[key],
+    }));
+  };
+
+  const handleExpandAll = () => {
+    setOpenSections({
+      production_ordering: true,
+      measurement: true,
+      precision: true,
+      categories: true,
+      production_floor: true,
+      branding: true,
+      members: true,
+      subscription: true,
+      profile: true,
+      cloud: true,
+      security: true,
+      migrations: true,
+      capabilities: true,
+      lock: true,
+      system: true,
+    });
+  };
+
+  const handleCollapseAll = () => {
+    setOpenSections({
+      production_ordering: false,
+      measurement: false,
+      precision: false,
+      categories: false,
+      production_floor: false,
+      branding: false,
+      members: false,
+      subscription: false,
+      profile: false,
+      cloud: false,
+      security: false,
+      migrations: false,
+      capabilities: false,
+      lock: false,
+      system: false,
+    });
   };
 
   const handleUpdateUnit = (unit: WeightUnit) => {
@@ -267,51 +381,80 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     );
   };
 
-  // Multi-preset category helper
+  // Multi-preset category helper (unified with Production Floor Mode — never auto-falls back to 'All' for unmapped categories)
   const getSelectedPresetCategories = (recipeCat: string): string[] => {
-    const mapVal = settings.categoryPresetMap ? settings.categoryPresetMap[recipeCat] : undefined;
-    if (!mapVal) return ['All'];
-    if (Array.isArray(mapVal)) {
-      return mapVal.length === 0 ? ['All'] : mapVal;
-    }
-    return [mapVal];
+    return getTargetPresetCategoriesForRecipeCategory(recipeCat, authoritativeCategoryPresetMap);
   };
 
-  // Multi-preset category toggle
-  const handleTogglePresetCategory = (recipeCat: string, presetCat: string) => {
-    const currentSelected = getSelectedPresetCategories(recipeCat);
+  // Explicit Owner-approved migration handlers (never automatic)
+  const handleApproveCategoryMigration = async () => {
+    if (!isOwnerRole) {
+      showNotification('Permission denied: Only workspace owners can approve shared category preset mappings.');
+      return;
+    }
+    setIsApplyingCategoryMigration(true);
+    try {
+      await store.approveCategoryMappingMigration();
+      showNotification('Approved category preset mappings saved to shared workspace.');
+    } catch (err: any) {
+      showNotification(err?.message || 'Failed to save workspace category preset mappings.');
+    } finally {
+      setIsApplyingCategoryMigration(false);
+    }
+  };
+
+  const handleDiscardLocalCategoryDifferences = () => {
+    store.discardLocalCategoryMappingDifferences();
+    showNotification('Local mapping differences discarded; keeping current shared workspace mapping.');
+  };
+
+  // Multi-preset category toggle (Owner-authorized workspace operation)
+  const handleTogglePresetCategory = async (recipeCat: string, presetCat: string) => {
+    if (!isOwnerRole) {
+      showNotification('Permission denied: Only workspace owners can modify shared workspace category mappings.');
+      return;
+    }
+    const currentSelected = getSelectedPresetCategories(recipeCat).filter((c) =>
+      c === 'All' || allPresetCategories.some((pc) => pc.toLowerCase() === c.toLowerCase())
+    );
     let updated: string[] = [];
 
     if (presetCat === 'All') {
-      // Toggle to All Presets
       updated = ['All'];
     } else {
       if (currentSelected.includes('All')) {
         updated = [presetCat];
       } else {
-        if (currentSelected.includes(presetCat)) {
-          const remaining = currentSelected.filter((c) => c !== presetCat);
-          updated = remaining.length === 0 ? ['All'] : remaining;
+        if (currentSelected.some((c) => c.toLowerCase() === presetCat.toLowerCase())) {
+          const remaining = currentSelected.filter((c) => c.toLowerCase() !== presetCat.toLowerCase());
+          updated = remaining.length === 0 ? [recipeCat] : remaining;
         } else {
           updated = [...currentSelected, presetCat];
         }
       }
     }
 
-    const currentMap = { ...(settings.categoryPresetMap || {}) };
+    const currentMap = { ...authoritativeCategoryPresetMap };
     currentMap[recipeCat] = updated;
-    onUpdateSettings({ categoryPresetMap: currentMap });
-
-    showNotification(
-      updated.includes('All')
-        ? `Recipe category "${recipeCat}" set to All Presets.`
-        : `Recipe category "${recipeCat}" mapped to ${updated.length} preset ${updated.length === 1 ? 'category' : 'categories'} (${updated.join(', ')}).`
-    );
+    try {
+      await store.saveWorkspaceCategoryPresetMap(currentMap);
+      showNotification(
+        updated.includes('All')
+          ? `Workspace category "${recipeCat}" set to All Presets.`
+          : `Workspace category "${recipeCat}" mapped to ${updated.join(', ')}.`
+      );
+    } catch (err: any) {
+      showNotification(err?.message || 'Failed to update shared workspace category mapping.');
+    }
   };
 
   // Add Category Handler
   const handleAddCategorySubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isOwnerRole) {
+      showNotification('Permission denied: Only workspace owners can add workspace categories.');
+      return;
+    }
     const cleanName = newCategoryName.trim();
     if (!cleanName) return;
 
@@ -320,21 +463,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       return;
     }
 
-    await store.addRecipeCategory(cleanName, newCategoryPresets.length > 0 ? newCategoryPresets : ['All']);
-    setNewCategoryName('');
-    setNewCategoryPresets(['All']);
-    setIsAddingCategory(false);
-    showNotification(`Category "${cleanName}" created successfully.`);
+    try {
+      await store.addRecipeCategory(cleanName, newCategoryPresets.length > 0 ? newCategoryPresets : ['All']);
+      setNewCategoryName('');
+      setNewCategoryPresets(['All']);
+      setIsAddingCategory(false);
+      showNotification(`Category "${cleanName}" created in shared workspace.`);
+    } catch (err: any) {
+      showNotification(err?.message || 'Failed to add category.');
+    }
   };
 
   // Rename Category Handler
   const handleStartEditingCategory = (catName: string) => {
+    if (!isOwnerRole) return;
     setEditingCategory(catName);
     setEditingCategoryNewName(catName);
     setDeletingCategory(null);
   };
 
   const handleRenameCategorySubmit = async (oldName: string) => {
+    if (!isOwnerRole) return;
     const cleanNew = editingCategoryNewName.trim();
     if (!cleanNew || cleanNew.toLowerCase() === oldName.toLowerCase()) {
       setEditingCategory(null);
@@ -350,40 +499,52 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       return;
     }
 
-    const updatedCount = await store.renameRecipeCategory(oldName, cleanNew);
-    setEditingCategory(null);
-    setEditingCategoryNewName('');
-    showNotification(
-      updatedCount > 0
-        ? `Renamed category to "${cleanNew}" and updated ${updatedCount} ${updatedCount === 1 ? 'recipe' : 'recipes'}.`
-        : `Renamed category to "${cleanNew}".`
-    );
+    try {
+      const updatedCount = await store.renameRecipeCategory(oldName, cleanNew);
+      setEditingCategory(null);
+      setEditingCategoryNewName('');
+      showNotification(
+        updatedCount > 0
+          ? `Renamed category to "${cleanNew}" and updated ${updatedCount} ${updatedCount === 1 ? 'recipe' : 'recipes'}.`
+          : `Renamed category to "${cleanNew}".`
+      );
+    } catch (err: any) {
+      showNotification(err?.message || 'Failed to rename category.');
+    }
   };
 
   // Delete Category Handler
   const handleStartDeletingCategory = (catName: string) => {
+    if (!isOwnerRole) return;
     setDeletingCategory(catName);
     setEditingCategory(null);
-    // Find an alternative category as default reassign target
     const otherCats = allRecipeCategories.filter((c) => c.toLowerCase() !== catName.toLowerCase());
     setDeleteReassignTarget(otherCats[0] || 'Uncategorized');
   };
 
   const handleDeleteCategoryConfirm = async () => {
-    if (!deletingCategory) return;
+    if (!deletingCategory || !isOwnerRole) return;
     const catToDelete = deletingCategory;
     const targetReassign = deleteReassignTarget || 'Uncategorized';
-    const updatedCount = await store.deleteRecipeCategory(catToDelete, targetReassign);
-    setDeletingCategory(null);
-    showNotification(
-      updatedCount > 0
-        ? `Deleted category "${catToDelete}". ${updatedCount} ${updatedCount === 1 ? 'recipe' : 'recipes'} moved to "${targetReassign}".`
-        : `Deleted category "${catToDelete}".`
-    );
+    try {
+      const updatedCount = await store.deleteRecipeCategory(catToDelete, targetReassign);
+      setDeletingCategory(null);
+      showNotification(
+        updatedCount > 0
+          ? `Deleted category "${catToDelete}". ${updatedCount} ${updatedCount === 1 ? 'recipe' : 'recipes'} moved to "${targetReassign}".`
+          : `Deleted category "${catToDelete}".`
+      );
+    } catch (err: any) {
+      showNotification(err?.message || 'Failed to delete category.');
+    }
   };
 
-  const handleAutoMatchCategories = () => {
-    const newMap: Record<string, string[]> = { ...(settings.categoryPresetMap as any || {}) };
+  const handleAutoMatchCategories = async () => {
+    if (!isOwnerRole) {
+      showNotification('Permission denied: Only workspace owners can modify shared workspace category mappings.');
+      return;
+    }
+    const newMap: Record<string, string | string[]> = { ...authoritativeCategoryPresetMap };
     allRecipeCategories.forEach((cat) => {
       const lower = cat.toLowerCase();
       if (lower.includes('cookie') || lower.includes('biscuit') || lower.includes('scone')) {
@@ -405,21 +566,31 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         newMap[cat] = ['Pie Dough'];
       } else if (lower.includes('shortbread') || lower.includes('tart')) {
         newMap[cat] = ['Shortbread'];
-      } else {
-        newMap[cat] = ['All'];
       }
     });
-    onUpdateSettings({ categoryPresetMap: newMap });
-    showNotification('Recipe categories automatically matched with corresponding packaging presets.');
+    try {
+      await store.saveWorkspaceCategoryPresetMap(newMap);
+      showNotification('Recipe categories matched with corresponding packaging presets in shared workspace.');
+    } catch (err: any) {
+      showNotification(err?.message || 'Failed to update shared workspace category mappings.');
+    }
   };
 
-  const handleResetAllToAllPresets = () => {
+  const handleResetAllToAllPresets = async () => {
+    if (!isOwnerRole) {
+      showNotification('Permission denied: Only workspace owners can modify shared workspace category mappings.');
+      return;
+    }
     const newMap: Record<string, string[]> = {};
     allRecipeCategories.forEach((cat) => {
       newMap[cat] = ['All'];
     });
-    onUpdateSettings({ categoryPresetMap: newMap });
-    showNotification('All recipe categories set to show All Presets.');
+    try {
+      await store.saveWorkspaceCategoryPresetMap(newMap);
+      showNotification('All recipe categories set to show All Presets in shared workspace.');
+    } catch (err: any) {
+      showNotification(err?.message || 'Failed to update shared workspace category mappings.');
+    }
   };
 
   const handleUpdateTheme = (theme: 'light' | 'dark') => {
@@ -468,110 +639,189 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <span>Application Settings</span>
           </h2>
           <p className="text-xs text-[#8B7E74] dark:text-[#A39E93]">
-            Configure measurement systems, business branding, decimal precision, and theme appearance. All settings are automatically saved and applied.
+            Configure production workflows, measurement systems, categories, cloud sync, and security. Tap any section to expand or collapse.
           </p>
         </div>
 
-        {saveFeedback && (
-          <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-[#E8F5E9] dark:bg-[#1B3520] border border-[#A5D6A7] dark:border-[#2E7D32] rounded-xl text-xs font-bold text-[#2E7D32] dark:text-[#81C784] shadow-sm animate-fade-in">
-            <CheckCircle2 className="w-4 h-4 shrink-0" />
-            <span>{saveFeedback}</span>
-          </div>
-        )}
-      </div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <button
+            type="button"
+            id="btn-settings-expand-all"
+            onClick={handleExpandAll}
+            className="px-3 py-1.5 rounded-lg border border-[#E5E1DA] dark:border-[#332F2B] bg-[#F5F2ED] dark:bg-[#25221F] text-[#5A534B] dark:text-[#EAE6E1] text-xs font-bold hover:bg-[#EEECE8] dark:hover:bg-[#332F2B] transition cursor-pointer"
+          >
+            Expand All
+          </button>
+          <button
+            type="button"
+            id="btn-settings-collapse-all"
+            onClick={handleCollapseAll}
+            className="px-3 py-1.5 rounded-lg border border-[#E5E1DA] dark:border-[#332F2B] bg-[#F5F2ED] dark:bg-[#25221F] text-[#5A534B] dark:text-[#EAE6E1] text-xs font-bold hover:bg-[#EEECE8] dark:hover:bg-[#332F2B] transition cursor-pointer"
+          >
+            Collapse All
+          </button>
 
-      <div className="space-y-6">
-        {/* Default Measurement System Selector */}
-        <div className="bg-white dark:bg-[#1E1B18] border border-[#E5E1DA] dark:border-[#2D2925] rounded-xl p-6 shadow-sm space-y-4">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-[#F5F2ED] dark:bg-[#25221F] border border-[#E5E1DA] dark:border-[#332F2B] text-[#5A534B] dark:text-[#EAE6E1] flex items-center justify-center">
-              <Scale className="w-5 h-5 text-[#D4A373]" />
-            </div>
-            <div>
-              <h3 className="font-serif font-semibold text-base text-[#5A534B] dark:text-[#EAE6E1]">
-                Default Measurement System
-              </h3>
-              <p className="text-xs text-[#8B7E74] dark:text-[#A39E93]">
-                Primary weight unit used across total recipe weights, batch calculations, and production sheets.
-              </p>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2">
-            {WEIGHT_UNITS.map((u) => (
-              <button
-                key={u.value}
-                id={`settings-unit-${u.value}`}
-                type="button"
-                onClick={() => handleUpdateUnit(u.value as WeightUnit)}
-                className={`p-4 rounded-xl border text-center font-bold text-sm transition cursor-pointer flex flex-col items-center justify-center gap-1 ${
-                  settings.defaultWeightUnit === u.value
-                    ? 'bg-[#5A534B] text-white border-[#5A534B] dark:bg-[#3D3732] shadow-sm ring-2 ring-[#D4A373]/50'
-                    : 'bg-[#F9F8F6] dark:bg-[#25221F] border-[#EEECE8] dark:border-[#332F2B] text-[#5A534B] dark:text-[#EAE6E1] hover:border-[#D4A373]'
-                }`}
-              >
-                <div>{u.label}</div>
-                {settings.defaultWeightUnit === u.value && (
-                  <span className="text-[10px] text-[#D4A373] font-semibold uppercase tracking-wider flex items-center gap-0.5">
-                    <Check className="w-3 h-3 inline" /> Active Default
-                  </span>
-                )}
-              </button>
-            ))}
-          </div>
-
-          {/* One-Click Ingredient Standardization */}
-          {onStandardizeAllRecipes && (
-            <div className="pt-3 border-t border-[#EEECE8] dark:border-[#332F2B] flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-[#FAF7F2] dark:bg-[#25221F] p-4 rounded-xl border">
-              <div>
-                <h4 className="font-bold text-xs text-[#5A534B] dark:text-[#EAE6E1]">
-                  Standardize All Existing Recipe Ingredients
-                </h4>
-                <p className="text-[11px] text-[#8B7E74] dark:text-[#A39E93]">
-                  Convert and align measuring unit inputs across all {recipesCount > 0 ? `${recipesCount} recipes` : 'bakery recipes'} to {(settings?.defaultWeightUnit || 'g').toUpperCase()}.
-                </p>
-              </div>
-
-              <button
-                type="button"
-                id="standardize-all-recipes-btn"
-                disabled={isStandardizing}
-                onClick={() => handleStandardize(settings?.defaultWeightUnit || 'g')}
-                className="inline-flex items-center justify-center gap-2 bg-[#D4A373] hover:bg-[#C49363] disabled:opacity-50 text-white font-bold px-4 py-2 rounded-xl text-xs transition shadow-sm shrink-0 cursor-pointer"
-              >
-                <Scale className="w-4 h-4" />
-                <span>
-                  {isStandardizing ? 'Standardizing...' : `Standardize All to ${(settings?.defaultWeightUnit || 'g').toUpperCase()}`}
-                </span>
-              </button>
-            </div>
-          )}
-
-          {standardizeStatus && (
-            <div className="p-3 bg-[#E8F5E9] dark:bg-[#1B3520] border border-[#A5D6A7] dark:border-[#2E7D32] rounded-xl text-xs font-bold text-[#2E7D32] dark:text-[#81C784] flex items-center gap-2">
-              <Check className="w-4 h-4 shrink-0" />
-              <span>{standardizeStatus}</span>
+          {saveFeedback && (
+            <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-[#E8F5E9] dark:bg-[#1B3520] border border-[#A5D6A7] dark:border-[#2E7D32] rounded-xl text-xs font-bold text-[#2E7D32] dark:text-[#81C784] shadow-sm animate-fade-in">
+              <CheckCircle2 className="w-4 h-4 shrink-0" />
+              <span>{saveFeedback}</span>
             </div>
           )}
         </div>
+      </div>
 
-        {/* Decimal Precision & Rounding Selector */}
-        <div className="bg-white dark:bg-[#1E1B18] border border-[#E5E1DA] dark:border-[#2D2925] rounded-xl p-6 shadow-sm space-y-4">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-[#F5F2ED] dark:bg-[#25221F] border border-[#E5E1DA] dark:border-[#332F2B] text-[#5A534B] dark:text-[#EAE6E1] flex items-center justify-center">
-              <Hash className="w-5 h-5 text-[#D4A373]" />
+      {/* Owner-Only Critical Production Notes Synchronization Review */}
+      <CriticalNotesSyncReview
+        userRole={userRole}
+        presets={presets}
+        recipes={recipes}
+      />
+
+      {/* Owner-Only Saved Device Production Order Notice (when section is collapsed) */}
+      {isOwnerRole && pendingProdOrderMigration?.hasDifferences && !openSections.production_ordering && (
+        <div
+          id="settings-legacy-prod-order-alert"
+          className="p-4 rounded-2xl border-2 border-[#D4A373] bg-[#FAF6F0] dark:bg-[#26211C] flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+        >
+          <div className="space-y-0.5">
+            <h3 className="text-xs sm:text-sm font-bold text-[#5A534B] dark:text-[#EAE6E1]">
+              Saved Device Production Option Order Detected
+            </h3>
+            <p className="text-[11px] text-[#8B7E74] dark:text-[#A39E93]">
+              Your Owner account/device has a saved production option order that differs from the shared workspace order. Review and promote it so all tablets match.
+            </p>
+          </div>
+          <button
+            id="btn-open-legacy-prod-order-review"
+            type="button"
+            onClick={() =>
+              setOpenSections((prev) => ({ ...prev, production_ordering: true }))
+            }
+            className="px-3.5 py-2 rounded-xl bg-[#D4A373] hover:bg-[#C29363] text-white text-xs font-bold shrink-0 cursor-pointer transition"
+          >
+            Review &amp; Promote Order
+          </button>
+        </div>
+      )}
+
+      <div className="space-y-4">
+        {/* Section 1: Production Option Ordering Settings */}
+        <CollapsibleSettingsSection
+          sectionKey="production_ordering"
+          title="Production Option Display Order"
+          description="Configure the exact sequence of quantity cards shown on the production floor screen."
+          icon={<SlidersHorizontal className="w-5 h-5 text-[#D4A373]" />}
+          badge={
+            isOwnerRole && pendingProdOrderMigration?.hasDifferences ? (
+              <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-amber-100 dark:bg-amber-950/60 border border-amber-300 dark:border-amber-800 text-amber-800 dark:text-amber-300">
+                Action Available
+              </span>
+            ) : undefined
+          }
+          isOpen={!!openSections.production_ordering}
+          onToggle={() => toggleSection('production_ordering')}
+        >
+          <ProductionOptionOrderingSettings
+            presets={presets || []}
+            productionOptionOrder={productionOptionOrder}
+            userRole={userRole}
+            onNotification={showNotification}
+          />
+        </CollapsibleSettingsSection>
+
+        {/* Section 2: Default Measurement System Selector */}
+        <CollapsibleSettingsSection
+          sectionKey="measurement"
+          title="Default Measurement System"
+          description="Primary weight unit used across total recipe weights, batch calculations, and production sheets."
+          icon={<Scale className="w-5 h-5 text-[#D4A373]" />}
+          badge={
+            <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-[#F5F2ED] dark:bg-[#25221F] border border-[#E5E1DA] dark:border-[#332F2B] text-[#5A534B] dark:text-[#EAE6E1]">
+              {(settings?.defaultWeightUnit || 'g').toUpperCase()}
+            </span>
+          }
+          isOpen={!!openSections.measurement}
+          onToggle={() => toggleSection('measurement')}
+        >
+          <div className="space-y-4 pt-1">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-1">
+              {WEIGHT_UNITS.map((u) => (
+                <button
+                  key={u.value}
+                  id={`settings-unit-${u.value}`}
+                  type="button"
+                  onClick={() => handleUpdateUnit(u.value as WeightUnit)}
+                  className={`p-4 rounded-xl border text-center font-bold text-sm transition cursor-pointer flex flex-col items-center justify-center gap-1 ${
+                    settings.defaultWeightUnit === u.value
+                      ? 'bg-[#5A534B] text-white border-[#5A534B] dark:bg-[#3D3732] shadow-sm ring-2 ring-[#D4A373]/50'
+                      : 'bg-[#F9F8F6] dark:bg-[#25221F] border-[#EEECE8] dark:border-[#332F2B] text-[#5A534B] dark:text-[#EAE6E1] hover:border-[#D4A373]'
+                  }`}
+                >
+                  <div>{u.label}</div>
+                  {settings.defaultWeightUnit === u.value && (
+                    <span className="text-[10px] text-[#D4A373] font-semibold uppercase tracking-wider flex items-center gap-0.5">
+                      <Check className="w-3 h-3 inline" /> Active Default
+                    </span>
+                  )}
+                </button>
+              ))}
             </div>
-            <div>
-              <h3 className="font-serif font-semibold text-base text-[#5A534B] dark:text-[#EAE6E1]">
-                Decimal Precision & Rounding
-              </h3>
-              <p className="text-xs text-[#8B7E74] dark:text-[#A39E93]">
-                Set how many decimal points to display across ingredient amounts, batch weights, and reports. Choose 0 decimals for whole integer rounding.
-              </p>
+
+            {/* Default Production Display Mode (Phase 2B.5.5) */}
+            <div className="pt-3 border-t border-[#EEECE8] dark:border-[#332F2B] space-y-2">
+              <div>
+                <h4 className="font-bold text-xs text-[#5A534B] dark:text-[#EAE6E1]">
+                  Default Production Display Mode
+                </h4>
+                <p className="text-[11px] text-[#8B7E74] dark:text-[#A39E93]">
+                  Authoritative presentation mode for scaling on the production floor. &quot;As Entered&quot; preserves each recipe line&apos;s original entry unit.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 pt-1">
+                {PRODUCTION_DISPLAY_MODES.map((mode) => {
+                  const isActive = (settings.defaultProductionDisplayMode || 'as_entered') === mode.value;
+                  return (
+                    <button
+                      key={mode.value}
+                      id={`settings-display-mode-${mode.value}`}
+                      type="button"
+                      onClick={() => onUpdateSettings({ defaultProductionDisplayMode: mode.value })}
+                      className={`p-3 rounded-xl border text-center font-bold text-xs transition cursor-pointer flex flex-col items-center justify-center gap-1 ${
+                        isActive
+                          ? 'bg-[#5A534B] text-white border-[#5A534B] dark:bg-[#3D3732] shadow-sm ring-2 ring-[#D4A373]/50'
+                          : 'bg-[#F9F8F6] dark:bg-[#25221F] border-[#EEECE8] dark:border-[#332F2B] text-[#5A534B] dark:text-[#EAE6E1] hover:border-[#D4A373]'
+                      }`}
+                    >
+                      <div>{mode.label}</div>
+                      {isActive && (
+                        <span className="text-[9px] text-[#D4A373] font-semibold uppercase tracking-wider flex items-center gap-0.5">
+                          <Check className="w-2.5 h-2.5 inline" /> Active Default
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           </div>
+        </CollapsibleSettingsSection>
 
-          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 pt-2">
+        {/* Section 3: Decimal Precision & Rounding Selector */}
+        <CollapsibleSettingsSection
+          sectionKey="precision"
+          title="Decimal Precision & Rounding"
+          description="Set how many decimal points to display across ingredient amounts, batch weights, and reports."
+          icon={<Hash className="w-5 h-5 text-[#D4A373]" />}
+          badge={
+            <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-[#F5F2ED] dark:bg-[#25221F] border border-[#E5E1DA] dark:border-[#332F2B] text-[#5A534B] dark:text-[#EAE6E1]">
+              {settings.decimalPlaces !== undefined ? `${settings.decimalPlaces} Decimals` : '2 Decimals'}
+            </span>
+          }
+          isOpen={!!openSections.precision}
+          onToggle={() => toggleSection('precision')}
+        >
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 pt-1">
             {[
               { value: 0, label: '0 Decimals', sub: 'Round to Whole (e.g. 150)' },
               { value: 1, label: '1 Decimal', sub: 'e.g. 150.5' },
@@ -601,10 +851,23 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               );
             })}
           </div>
-        </div>
+        </CollapsibleSettingsSection>
 
-        {/* Recipe Categories & Preset Routing (Multi-Select & Management) */}
-        <div className="bg-white dark:bg-[#1E1B18] border border-[#E5E1DA] dark:border-[#2D2925] rounded-xl p-6 shadow-sm space-y-5">
+        {/* Section 4: Recipe Categories & Preset Routing (Multi-Select & Management) */}
+        <CollapsibleSettingsSection
+          sectionKey="categories"
+          title="Recipe Categories & Preset Routing"
+          description="Add, edit, or delete recipe categories, and choose which packaging presets route to each category."
+          icon={<Sliders className="w-5 h-5 text-[#D4A373]" />}
+          badge={
+            <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-[#F5F2ED] dark:bg-[#25221F] border border-[#E5E1DA] dark:border-[#332F2B] text-[#5A534B] dark:text-[#EAE6E1]">
+              {allRecipeCategories.length} Categories
+            </span>
+          }
+          isOpen={!!openSections.categories}
+          onToggle={() => toggleSection('categories')}
+        >
+          <div className="space-y-5 pt-1">
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-xl bg-[#F5F2ED] dark:bg-[#25221F] border border-[#E5E1DA] dark:border-[#332F2B] text-[#5A534B] dark:text-[#EAE6E1] flex items-center justify-center">
@@ -620,49 +883,124 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
             </div>
 
-            {/* Section Actions */}
-            <div className="flex items-center flex-wrap gap-2 shrink-0">
-              <button
-                type="button"
-                id="settings-add-category-toggle-btn"
-                onClick={() => {
-                  setIsAddingCategory(!isAddingCategory);
-                  setEditingCategory(null);
-                  setDeletingCategory(null);
-                }}
-                className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
-                  isAddingCategory
-                    ? 'bg-[#D4A373] text-white'
-                    : 'bg-[#FAF7F2] dark:bg-[#25221F] hover:bg-[#F0EBE1] dark:hover:bg-[#332F2B] text-[#5A534B] dark:text-[#D4CEC7] border border-[#E5E1DA] dark:border-[#332F2B]'
-                }`}
-              >
-                <Plus className="w-3.5 h-3.5" />
-                <span>Add Category</span>
-              </button>
+            {/* Section Actions (Owner-only for shared workspace configuration) */}
+            {isOwnerRole ? (
+              <div className="flex items-center flex-wrap gap-2 shrink-0">
+                <button
+                  type="button"
+                  id="settings-add-category-toggle-btn"
+                  onClick={() => {
+                    setIsAddingCategory(!isAddingCategory);
+                    setEditingCategory(null);
+                    setDeletingCategory(null);
+                  }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
+                    isAddingCategory
+                      ? 'bg-[#D4A373] text-white'
+                      : 'bg-[#FAF7F2] dark:bg-[#25221F] hover:bg-[#F0EBE1] dark:hover:bg-[#332F2B] text-[#5A534B] dark:text-[#D4CEC7] border border-[#E5E1DA] dark:border-[#332F2B]'
+                  }`}
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Add Category</span>
+                </button>
 
-              <button
-                type="button"
-                id="settings-automatch-categories-btn"
-                onClick={handleAutoMatchCategories}
-                className="px-3 py-1.5 bg-[#FAF7F2] dark:bg-[#25221F] hover:bg-[#F0EBE1] dark:hover:bg-[#332F2B] text-[#5A534B] dark:text-[#D4CEC7] border border-[#E5E1DA] dark:border-[#332F2B] rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
-                title="Auto-match recipe categories to corresponding preset categories"
-              >
-                <Sparkles className="w-3.5 h-3.5 text-[#D4A373]" />
-                <span>Auto-Match</span>
-              </button>
+                <button
+                  type="button"
+                  id="settings-automatch-categories-btn"
+                  onClick={handleAutoMatchCategories}
+                  className="px-3 py-1.5 bg-[#FAF7F2] dark:bg-[#25221F] hover:bg-[#F0EBE1] dark:hover:bg-[#332F2B] text-[#5A534B] dark:text-[#D4CEC7] border border-[#E5E1DA] dark:border-[#332F2B] rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
+                  title="Auto-match recipe categories to corresponding preset categories"
+                >
+                  <Sparkles className="w-3.5 h-3.5 text-[#D4A373]" />
+                  <span>Auto-Match</span>
+                </button>
 
-              <button
-                type="button"
-                id="settings-reset-all-presets-btn"
-                onClick={handleResetAllToAllPresets}
-                className="px-3 py-1.5 bg-[#FAF7F2] dark:bg-[#25221F] hover:bg-[#F0EBE1] dark:hover:bg-[#332F2B] text-[#5A534B] dark:text-[#D4CEC7] border border-[#E5E1DA] dark:border-[#332F2B] rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
-                title="Set all recipe categories to route All Presets"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                <span>All Presets</span>
-              </button>
-            </div>
+                <button
+                  type="button"
+                  id="settings-reset-all-presets-btn"
+                  onClick={handleResetAllToAllPresets}
+                  className="px-3 py-1.5 bg-[#FAF7F2] dark:bg-[#25221F] hover:bg-[#F0EBE1] dark:hover:bg-[#332F2B] text-[#5A534B] dark:text-[#D4CEC7] border border-[#E5E1DA] dark:border-[#332F2B] rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
+                  title="Set all recipe categories to route All Presets"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>All Presets</span>
+                </button>
+              </div>
+            ) : (
+              <div className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#FAF7F2] dark:bg-[#25221F] border border-[#E5E1DA] dark:border-[#332F2B] text-[11px] font-semibold text-[#8B7E74] dark:text-[#A39E93]">
+                <Lock className="w-3.5 h-3.5 text-[#D4A373]" />
+                <span>Shared Workspace Routing (Owner Managed)</span>
+              </div>
+            )}
           </div>
+
+          {/* Explicit Owner Approval Banner when local device mappings differ from shared workspace mappings */}
+          {isOwnerRole && pendingCategoryMigration?.hasDifferences && (
+            <div
+              id="category-mapping-migration-review-card"
+              className="p-4 rounded-xl bg-amber-50/90 dark:bg-amber-950/30 border border-amber-300 dark:border-amber-800/70 space-y-3"
+            >
+              <div className="flex items-start gap-2.5">
+                <AlertTriangle className="w-4 h-4 text-amber-700 dark:text-amber-400 shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <div className="text-xs font-bold text-amber-950 dark:text-amber-200">
+                    Local Device Category Mapping Differences Detected — Explicit Owner Approval Required
+                  </div>
+                  <p className="text-xs text-amber-800 dark:text-amber-300/90 leading-relaxed">
+                    This device has locally saved category-to-preset mappings that differ from the shared workspace configuration. Review the exact changes below before deciding whether to apply them across all workspace devices.
+                  </p>
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-amber-200 dark:border-amber-800/60 bg-white dark:bg-[#1E1B18] divide-y divide-[#EEECE8] dark:divide-[#2D2925]">
+                {pendingCategoryMigration.diffs.map((diff) => (
+                  <div
+                    key={diff.category}
+                    className="px-3 py-2 flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 text-xs"
+                  >
+                    <div className="font-bold text-[#5A534B] dark:text-[#EAE6E1]">
+                      {diff.category}
+                    </div>
+                    <div className="flex items-center flex-wrap gap-1.5 text-[11px]">
+                      <span className="px-2 py-0.5 rounded bg-stone-100 dark:bg-zinc-800 text-stone-600 dark:text-zinc-300">
+                        Workspace: {diff.workspaceExplicitValue ? diff.workspaceEffectiveTargets.join(', ') : `Unmapped (${diff.workspaceEffectiveTargets.join(', ')})`}
+                      </span>
+                      <span className="text-[#8B7E74]">→</span>
+                      <span className="px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-900/50 text-amber-900 dark:text-amber-200 font-bold">
+                        Proposed: {diff.localProposedTargets.join(', ')}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="flex items-center flex-wrap gap-2 pt-1">
+                <button
+                  type="button"
+                  id="approve-category-mapping-migration-btn"
+                  disabled={isApplyingCategoryMigration}
+                  onClick={handleApproveCategoryMigration}
+                  className="px-3.5 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  <span>
+                    {isApplyingCategoryMigration
+                      ? 'Saving to Workspace...'
+                      : 'Approve & Save Exact Changes to Shared Workspace'}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  id="discard-local-category-mapping-btn"
+                  disabled={isApplyingCategoryMigration}
+                  onClick={handleDiscardLocalCategoryDifferences}
+                  className="px-3 py-1.5 rounded-lg bg-white dark:bg-[#25221F] border border-amber-300 dark:border-amber-800 text-xs font-semibold text-[#5A534B] dark:text-[#EAE6E1] hover:bg-stone-50 cursor-pointer disabled:opacity-50"
+                >
+                  Keep Shared Workspace Mapping (Discard Local)
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Inline Add Category Form */}
           {isAddingCategory && (
@@ -798,14 +1136,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <p className="text-xs text-[#8B7E74] dark:text-[#A39E93] max-w-sm mx-auto">
                 No recipe categories are currently defined in the system. Create one to organize recipes and route packaging presets.
               </p>
-              <button
-                type="button"
-                onClick={() => setIsAddingCategory(true)}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-[#D4A373] text-white rounded-lg text-xs font-semibold cursor-pointer"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                <span>Add Your First Category</span>
-              </button>
+              {isOwnerRole && (
+                <button
+                  type="button"
+                  onClick={() => setIsAddingCategory(true)}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-[#D4A373] text-white rounded-lg text-xs font-semibold cursor-pointer"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Add Your First Category</span>
+                </button>
+              )}
             </div>
           )}
 
@@ -880,27 +1220,29 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                             {recipesInCat} {recipesInCat === 1 ? 'recipe' : 'recipes'}
                           </span>
 
-                          {/* Edit & Delete Category Action Icons */}
-                          <div className="flex items-center gap-0.5 ml-1">
-                            <button
-                              type="button"
-                              id={`edit-category-btn-${catName.toLowerCase().replace(/\s+/g, '-')}`}
-                              onClick={() => handleStartEditingCategory(catName)}
-                              className="p-1 text-[#8B7E74] hover:text-[#D4A373] dark:text-[#A39E93] dark:hover:text-[#D4A373] rounded hover:bg-[#EEECE8] dark:hover:bg-[#332F2B] transition cursor-pointer"
-                              title={`Edit / Rename category "${catName}"`}
-                            >
-                              <Edit2 className="w-3.5 h-3.5" />
-                            </button>
-                            <button
-                              type="button"
-                              id={`delete-category-btn-${catName.toLowerCase().replace(/\s+/g, '-')}`}
-                              onClick={() => handleStartDeletingCategory(catName)}
-                              className="p-1 text-[#8B7E74] hover:text-red-500 dark:text-[#A39E93] dark:hover:text-red-400 rounded hover:bg-[#EEECE8] dark:hover:bg-[#332F2B] transition cursor-pointer"
-                              title={`Delete category "${catName}"`}
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
+                          {/* Edit & Delete Category Action Icons (Owner-only) */}
+                          {isOwnerRole && (
+                            <div className="flex items-center gap-0.5 ml-1">
+                              <button
+                                type="button"
+                                id={`edit-category-btn-${catName.toLowerCase().replace(/\s+/g, '-')}`}
+                                onClick={() => handleStartEditingCategory(catName)}
+                                className="p-1 text-[#8B7E74] hover:text-[#D4A373] dark:text-[#A39E93] dark:hover:text-[#D4A373] rounded hover:bg-[#EEECE8] dark:hover:bg-[#332F2B] transition cursor-pointer"
+                                title={`Edit / Rename category "${catName}"`}
+                              >
+                                <Edit2 className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                id={`delete-category-btn-${catName.toLowerCase().replace(/\s+/g, '-')}`}
+                                onClick={() => handleStartDeletingCategory(catName)}
+                                className="p-1 text-[#8B7E74] hover:text-red-500 dark:text-[#A39E93] dark:hover:text-red-400 rounded hover:bg-[#EEECE8] dark:hover:bg-[#332F2B] transition cursor-pointer"
+                                title={`Delete category "${catName}"`}
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
@@ -992,8 +1334,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       <button
                         type="button"
                         id={`multi-preset-${catName.toLowerCase().replace(/\s+/g, '-')}-all`}
+                        disabled={!isOwnerRole}
                         onClick={() => handleTogglePresetCategory(catName, 'All')}
-                        className={`p-2.5 rounded-xl border text-xs font-semibold flex items-center gap-2 cursor-pointer transition select-none text-left ${
+                        className={`p-2.5 rounded-xl border text-xs font-semibold flex items-center gap-2 transition select-none text-left ${
+                          !isOwnerRole ? 'opacity-70 cursor-not-allowed ' : 'cursor-pointer '
+                        }${
                           isAllSelected
                             ? 'bg-white dark:bg-[#1E1B18] border-[#D4A373] text-[#5A534B] dark:text-[#EAE6E1] shadow-xs ring-1 ring-[#D4A373]'
                             : 'bg-[#FAF7F2] dark:bg-[#1E1B18]/60 border-[#E5E1DA] dark:border-[#332F2B] text-[#8B7E74] dark:text-[#A39E93] hover:border-[#D4A373]/60'
@@ -1013,7 +1358,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
                       {/* Individual Preset Categories Multi-Select Options */}
                       {allPresetCategories.map((presetCat) => {
-                        const isSelected = !isAllSelected && selectedPresets.includes(presetCat);
+                        const isSelected =
+                          !isAllSelected &&
+                          selectedPresets.some((sp) => sp.toLowerCase() === presetCat.toLowerCase());
                         const pCount = presetCounts[presetCat] || 0;
                         const pIcon = PRESET_CATEGORY_ICONS[presetCat] || '📦';
 
@@ -1022,8 +1369,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                             key={presetCat}
                             type="button"
                             id={`multi-preset-${catName.toLowerCase().replace(/\s+/g, '-')}-${presetCat.toLowerCase().replace(/\s+/g, '-')}`}
+                            disabled={!isOwnerRole}
                             onClick={() => handleTogglePresetCategory(catName, presetCat)}
-                            className={`p-2.5 rounded-xl border text-xs font-semibold flex items-center gap-2 cursor-pointer transition select-none text-left ${
+                            className={`p-2.5 rounded-xl border text-xs font-semibold flex items-center gap-2 transition select-none text-left ${
+                              !isOwnerRole ? 'opacity-70 cursor-not-allowed ' : 'cursor-pointer '
+                            }${
                               isSelected
                                 ? 'bg-white dark:bg-[#1E1B18] border-[#D4A373] text-[#5A534B] dark:text-[#EAE6E1] shadow-xs ring-1 ring-[#D4A373]'
                                 : 'bg-[#FAF7F2] dark:bg-[#1E1B18]/60 border-[#E5E1DA] dark:border-[#332F2B] text-[#8B7E74] dark:text-[#A39E93] hover:border-[#D4A373]/60'
@@ -1051,41 +1401,72 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             })}
           </div>
         </div>
+        </CollapsibleSettingsSection>
 
-        {/* Workspace Branding & Appearance (Phase 0.5) */}
-        <SettingsSectionErrorBoundary
-          sectionTitle="Workspace Branding & Appearance"
-          fallbackMessage="Unable to load workspace branding settings. Please try again."
+        {/* Section 6: Workspace Branding & Appearance (Phase 0.5) */}
+        <CollapsibleSettingsSection
+          sectionKey="branding"
+          title="Workspace Branding & Appearance"
+          description="Manage bakery theme palette, display name, and visual workspace identity."
+          icon={<Sparkles className="w-5 h-5 text-[#D4A373]" />}
+          isOpen={!!openSections.branding}
+          onToggle={() => toggleSection('branding')}
         >
-          <BrandingSettings onSuccessNotice={showNotification} />
-        </SettingsSectionErrorBoundary>
+          <SettingsSectionErrorBoundary
+            sectionTitle="Workspace Branding & Appearance"
+            fallbackMessage="Unable to load workspace branding settings. Please try again."
+          >
+            <BrandingSettings onSuccessNotice={showNotification} />
+          </SettingsSectionErrorBoundary>
+        </CollapsibleSettingsSection>
 
-        {/* Workspace Members & Access Management (Phase 0.6) */}
-        <SettingsSectionErrorBoundary
-          sectionTitle="Members & Access"
-          fallbackMessage="Unable to load workspace members. Please try again."
+        {/* Section 7: Workspace Members & Access Management (Phase 0.6) */}
+        <CollapsibleSettingsSection
+          sectionKey="members"
+          title="Members & Access Management"
+          description="Control team access, roles (Owner, Editor, Viewer), and invite collaborators."
+          icon={<User className="w-5 h-5 text-[#D4A373]" />}
+          isOpen={!!openSections.members}
+          onToggle={() => toggleSection('members')}
         >
-          <MembersManagement onSuccessNotice={showNotification} />
-        </SettingsSectionErrorBoundary>
+          <SettingsSectionErrorBoundary
+            sectionTitle="Members & Access"
+            fallbackMessage="Unable to load workspace members. Please try again."
+          >
+            <MembersManagement onSuccessNotice={showNotification} />
+          </SettingsSectionErrorBoundary>
+        </CollapsibleSettingsSection>
 
-        {/* Business Branding & Waste Defaults */}
+        {/* Section 8: Workspace Subscription & Plan Entitlements (Phase 1.0) */}
+        <CollapsibleSettingsSection
+          sectionKey="subscription"
+          title="Subscription & Entitlements"
+          description="Current workspace subscription tier, recipe limits, and plan features."
+          icon={<Tag className="w-5 h-5 text-[#D4A373]" />}
+          isOpen={!!openSections.subscription}
+          onToggle={() => toggleSection('subscription')}
+        >
+          <SettingsSectionErrorBoundary
+            sectionTitle="Subscription & Entitlements"
+            fallbackMessage="Unable to load subscription details. Please try again."
+          >
+            <SubscriptionSettings onSuccessNotice={showNotification} />
+          </SettingsSectionErrorBoundary>
+        </CollapsibleSettingsSection>
+
+        {/* Section 9: Business Branding & Waste Defaults */}
+        <CollapsibleSettingsSection
+          sectionKey="profile"
+          title="Bakery Profile & Default Waste"
+          description="Custom branding displayed on dashboard headers, printed production sheets, and PDF exports."
+          icon={<Building className="w-5 h-5 text-[#D4A373]" />}
+          isOpen={!!openSections.profile}
+          onToggle={() => toggleSection('profile')}
+        >
         <form
           onSubmit={handleSaveBusinessInfo}
-          className="bg-white dark:bg-[#1E1B18] border border-[#E5E1DA] dark:border-[#2D2925] rounded-xl p-6 shadow-sm space-y-4"
+          className="space-y-4 pt-1"
         >
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-[#F5F2ED] dark:bg-[#25221F] border border-[#E5E1DA] dark:border-[#332F2B] text-[#5A534B] dark:text-[#EAE6E1] flex items-center justify-center">
-              <Building className="w-5 h-5 text-[#D4A373]" />
-            </div>
-            <div>
-              <h3 className="font-serif font-semibold text-base text-[#5A534B] dark:text-[#EAE6E1]">
-                Bakery Profile & Default Waste
-              </h3>
-              <p className="text-xs text-[#8B7E74] dark:text-[#A39E93]">
-                Custom branding displayed on dashboard headers, printed production sheets, and PDF exports.
-              </p>
-            </div>
-          </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
@@ -1133,9 +1514,33 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </button>
           </div>
         </form>
+        </CollapsibleSettingsSection>
 
-        {/* Cloud Synchronization & Storage */}
-        <div className="bg-white dark:bg-[#1E1B18] border border-[#E5E1DA] dark:border-[#2D2925] rounded-xl p-6 shadow-sm space-y-4">
+        {/* Section 10: Cloud Synchronization & Storage */}
+        <CollapsibleSettingsSection
+          sectionKey="cloud"
+          title="Cloud Synchronization & Persistence"
+          description="Real-time multi-device database sync powered by Firebase Firestore."
+          icon={<Cloud className="w-5 h-5 text-[#D4A373]" />}
+          badge={
+            <span
+              className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold ${
+                syncStatus.status === 'synced'
+                  ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800/40'
+                  : syncStatus.status === 'syncing'
+                  ? 'bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-300 border border-amber-200 dark:border-amber-800/40'
+                  : syncStatus.status === 'offline'
+                  ? 'bg-stone-100 text-stone-600 dark:bg-stone-800 dark:text-stone-300 border border-stone-200 dark:border-stone-700'
+                  : 'bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-300 border border-rose-200 dark:border-rose-800/40'
+              }`}
+            >
+              {syncStatus.status.toUpperCase()}
+            </span>
+          }
+          isOpen={!!openSections.cloud}
+          onToggle={() => toggleSection('cloud')}
+        >
+          <div className="space-y-4 pt-1">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             <div>
               <h3 className="font-serif font-semibold text-base text-[#5A534B] dark:text-[#EAE6E1] flex items-center gap-2">
@@ -1192,10 +1597,25 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <span>{syncStatus.lastSynced ? syncStatus.lastSynced.toLocaleTimeString() : 'Just now'}</span>
             </div>
           </div>
-        </div>
+          </div>
+        </CollapsibleSettingsSection>
 
-        {/* Phase 0 Zero-Trust Security & Workspace Isolation */}
-        <div id="phase0-security-hardening-card" className="bg-white dark:bg-[#1E1B18] border border-[#E5E1DA] dark:border-[#2D2925] rounded-xl p-6 shadow-sm space-y-4">
+        {/* Section 11: Phase 0 Zero-Trust Security & Workspace Isolation */}
+        <CollapsibleSettingsSection
+          id="phase0-security-hardening-card"
+          sectionKey="security"
+          title="Phase 0 — Enterprise Zero-Trust Security"
+          description="Enforces strict Zero-Trust RBAC. All recipes, ingredients, presets, and mixers are non-destructively scoped to workspace ws-main with owner validation."
+          icon={<ShieldCheck className="w-5 h-5 text-amber-600" />}
+          badge={
+            <span className="text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 border border-amber-300 dark:border-amber-800">
+              Proprietary Protection
+            </span>
+          }
+          isOpen={!!openSections.security}
+          onToggle={() => toggleSection('security')}
+        >
+          <div className="space-y-4 pt-1">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             <div className="flex items-start gap-3">
               <div className="w-10 h-10 rounded-xl bg-amber-500/10 text-amber-600 dark:text-amber-400 flex items-center justify-center shrink-0 border border-amber-500/20">
@@ -1216,29 +1636,36 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
             </div>
 
-            <div className="flex items-center gap-2 shrink-0">
-              <button
-                type="button"
-                id="btn-scan-phase0"
-                onClick={handleScanMigration}
-                disabled={isScanning}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#F5F2ED] dark:bg-[#25221F] hover:bg-[#EEECE8] dark:hover:bg-[#332F2B] text-[#5A534B] dark:text-[#EAE6E1] text-xs font-bold rounded-lg border border-[#E5E1DA] dark:border-[#332F2B] transition cursor-pointer disabled:opacity-50"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${isScanning ? 'animate-spin' : ''}`} />
-                <span>{isScanning ? 'Scanning DB...' : 'Scan Database'}</span>
-              </button>
+            {isOwnerRole ? (
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  id="btn-scan-phase0"
+                  onClick={handleScanMigration}
+                  disabled={isScanning}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#F5F2ED] dark:bg-[#25221F] hover:bg-[#EEECE8] dark:hover:bg-[#332F2B] text-[#5A534B] dark:text-[#EAE6E1] text-xs font-bold rounded-lg border border-[#E5E1DA] dark:border-[#332F2B] transition cursor-pointer disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isScanning ? 'animate-spin' : ''}`} />
+                  <span>{isScanning ? 'Scanning DB...' : 'Scan Database'}</span>
+                </button>
 
-              <button
-                type="button"
-                id="btn-execute-phase0"
-                onClick={() => setMigrationConfirmOpen(true)}
-                disabled={isMigrating}
-                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-lg shadow-sm transition cursor-pointer disabled:opacity-50"
-              >
+                <button
+                  type="button"
+                  id="btn-execute-phase0"
+                  onClick={() => setMigrationConfirmOpen(true)}
+                  disabled={isMigrating}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-lg shadow-sm transition cursor-pointer disabled:opacity-50"
+                >
+                  <Lock className="w-3.5 h-3.5" />
+                  <span>{isMigrating ? 'Hardening...' : 'Execute Phase 0 Migration'}</span>
+                </button>
+              </div>
+            ) : (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-stone-100 dark:bg-zinc-800 border border-stone-200 dark:border-zinc-700 text-stone-600 dark:text-zinc-400 text-xs font-bold shrink-0">
                 <Lock className="w-3.5 h-3.5" />
-                <span>{isMigrating ? 'Hardening...' : 'Execute Phase 0 Migration'}</span>
-              </button>
-            </div>
+                <span>Owner-Only Security Utility</span>
+              </span>
+            )}
           </div>
 
           {/* Security Status Indicators */}
@@ -1279,15 +1706,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <div className="p-3 rounded-lg bg-stone-50 dark:bg-[#2A2623] border border-stone-200 dark:border-[#3D3733] text-xs space-y-1.5 font-mono">
               <div className="font-bold text-[#5A534B] dark:text-[#EAE6E1] flex items-center justify-between">
                 <span>Database Scan Summary:</span>
-                <span className={scanReport.unscopedCount === 0 ? 'text-emerald-600' : 'text-amber-600'}>
-                  {scanReport.unscopedCount === 0 ? '✓ All Documents Scoped' : `${scanReport.unscopedCount} Unscoped Items Found`}
+                <span className={scanReport.totalUnscopedCount === 0 ? 'text-emerald-600' : 'text-amber-600'}>
+                  {scanReport.totalUnscopedCount === 0 ? '✓ All Documents Scoped' : `${scanReport.totalUnscopedCount} Unscoped Items Found`}
                 </span>
               </div>
               <div className="text-[#8B7E74] dark:text-[#A39E93] text-[11px] grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1">
-                <div>Recipes: {scanReport.recipesUnscoped} unscoped / {scanReport.totalRecipes} total</div>
-                <div>Presets: {scanReport.presetsUnscoped} unscoped / {scanReport.totalPresets} total</div>
-                <div>Mixers: {scanReport.mixersUnscoped} unscoped / {scanReport.totalMixers} total</div>
-                <div>History: {scanReport.historyUnscoped} unscoped / {scanReport.totalHistory} total</div>
+                <div>Recipes: {scanReport.unscopedRecipesCount} unscoped</div>
+                <div>Presets: {scanReport.unscopedPresetsCount} unscoped</div>
+                <div>Mixers: {scanReport.unscopedMixersCount} unscoped</div>
+                <div>History: {scanReport.unscopedHistoryCount} unscoped</div>
               </div>
             </div>
           )}
@@ -1306,7 +1733,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <span>{migrationResult.message}</span>
               </div>
               <div className="mt-1 text-[11px] opacity-90 font-mono">
-                {migrationResult.migratedCount} documents securely scoped to {migrationResult.workspaceId}.
+                {Object.values(migrationResult.migratedCounts || {}).reduce((a, b) => a + b, 0)} documents securely scoped to workspace.
               </div>
             </div>
           )}
@@ -1325,10 +1752,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <span>→</span>
             </button>
           </div>
-        </div>
+          </div>
+        </CollapsibleSettingsSection>
 
         {/* Phase 0 Migration Confirmation Modal */}
-        {migrationConfirmOpen && (
+        {isOwnerRole && migrationConfirmOpen && (
           <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
             <div className="bg-white dark:bg-[#1E1B18] border border-[#E5E1DA] dark:border-[#2D2925] rounded-xl max-w-lg w-full p-6 shadow-xl space-y-4">
               <div className="flex items-start gap-3">
@@ -1380,67 +1808,245 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         )}
 
-        {/* Appearance & Verification Suite */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          {/* Theme Toggle */}
-          <div className="bg-white dark:bg-[#1E1B18] border border-[#E5E1DA] dark:border-[#2D2925] rounded-xl p-6 shadow-sm space-y-4">
-            <h3 className="font-serif font-semibold text-base text-[#5A534B] dark:text-[#EAE6E1]">
-              Theme Mode
-            </h3>
-            <div className="flex items-center gap-3">
-              <button
-                type="button"
-                onClick={() => handleUpdateTheme('light')}
-                className={`flex-1 p-3 rounded-xl border font-bold text-xs flex items-center justify-center gap-2 transition cursor-pointer ${
-                  settings.theme === 'light'
-                    ? 'bg-[#5A534B] text-white border-[#5A534B] ring-2 ring-[#D4A373]/50'
-                    : 'bg-[#F9F8F6] dark:bg-[#25221F] border-[#EEECE8] dark:border-[#332F2B] text-[#5A534B] dark:text-[#EAE6E1]'
-                }`}
-              >
-                <Sun className="w-4 h-4 text-[#D4A373]" />
-                <span>Light Theme</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => handleUpdateTheme('dark')}
-                className={`flex-1 p-3 rounded-xl border font-bold text-xs flex items-center justify-center gap-2 transition cursor-pointer ${
-                  settings.theme === 'dark'
-                    ? 'bg-[#5A534B] text-white border-[#5A534B] ring-2 ring-[#D4A373]/50'
-                    : 'bg-[#F9F8F6] dark:bg-[#25221F] border-[#EEECE8] dark:border-[#332F2B] text-[#5A534B] dark:text-[#EAE6E1]'
-                }`}
-              >
-                <Moon className="w-4 h-4 text-[#D4A373]" />
-                <span>Dark Theme</span>
-              </button>
-            </div>
+        {/* Section 12: Master Ingredient Linking Migrations (Stages 1 & 2) */}
+        <CollapsibleSettingsSection
+          sectionKey="migrations"
+          title="Master Ingredient Linking Migrations (Closed & Locked)"
+          description="Phase 2A Stage 1 (Deterministic) and Stage 2 (Ambiguity) Master Ingredient Linking utilities."
+          icon={<Lock className="w-5 h-5 text-emerald-600" />}
+          badge={
+            <span className="text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded bg-emerald-100 dark:bg-emerald-950/60 text-emerald-800 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-800">
+              Closed & Locked
+            </span>
+          }
+          isOpen={!!openSections.migrations}
+          onToggle={() => toggleSection('migrations')}
+        >
+          <div className="space-y-4 pt-1">
+            <Stage1MigrationCard onNotification={showNotification} />
+            <Stage2MigrationCard onNotification={showNotification} />
           </div>
+        </CollapsibleSettingsSection>
 
-          {/* Unit Test Suite Launcher */}
-          <div className="bg-white dark:bg-[#1E1B18] border border-[#E5E1DA] dark:border-[#2D2925] rounded-xl p-6 shadow-sm space-y-3 flex flex-col justify-between">
-            <div>
-              <h3 className="font-serif font-semibold text-base text-[#5A534B] dark:text-[#EAE6E1] flex items-center gap-2">
-                <FlaskConical className="w-5 h-5 text-[#D4A373]" />
-                <span>Unit Verification Suite</span>
-              </h3>
-              <p className="text-xs text-[#8B7E74] dark:text-[#A39E93] mt-1">
-                Run internal tests for scaling math, waste formulas, unit conversions, and capacity limits.
-              </p>
-            </div>
+        {/* Section 13: Workspace Capabilities & Modular Features (Phase 2 Foundation) */}
+        <CollapsibleSettingsSection
+          sectionKey="capabilities"
+          title="Workspace Capabilities & Modular Features"
+          description="Enable or disable modular features (Production Floor, Costing & Margins, Inventory, Label Printing)."
+          icon={<Sparkles className="w-5 h-5 text-[#D4A373]" />}
+          isOpen={!!openSections.capabilities}
+          onToggle={() => toggleSection('capabilities')}
+        >
+          <SettingsSectionErrorBoundary
+            sectionTitle="Workspace Capabilities"
+            fallbackMessage="Unable to load workspace capabilities."
+          >
+            <WorkspaceCapabilitiesSettings onNotification={showNotification} />
+          </SettingsSectionErrorBoundary>
+        </CollapsibleSettingsSection>
 
-            <button
-              id="settings-run-tests-btn"
-              type="button"
-              onClick={onOpenUnitTests}
-              className="w-full bg-[#F5F2ED] dark:bg-[#25221F] text-[#5A534B] dark:text-[#EAE6E1] hover:bg-[#EEECE8] font-bold py-2.5 px-4 rounded-xl text-xs transition cursor-pointer flex items-center justify-center gap-2 border border-[#E5E1DA] dark:border-[#332F2B]"
+        {/* Section 5: Production Floor Mode Operational Workspace Setting */}
+        <CollapsibleSettingsSection
+          id="settings-production-floor-section"
+          sectionKey="production_floor"
+          title="Production Floor Mode"
+          description="When enabled, operators can use the simplified Production Floor interface for recipe scaling and mixing."
+          icon={<ChefHat className="w-5 h-5 stroke-[2.5]" />}
+          badge={
+            <span
+              id="production-floor-status-badge"
+              className={`px-2.5 py-0.5 text-[10px] font-bold rounded-full uppercase tracking-wider ${
+                isProductionFloorEnabled
+                  ? 'bg-emerald-100 dark:bg-emerald-950/50 text-emerald-800 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-800'
+                  : 'bg-stone-100 dark:bg-zinc-800 text-stone-600 dark:text-zinc-400 border border-stone-200 dark:border-zinc-700'
+              }`}
             >
-              <ShieldCheck className="w-4 h-4 text-[#D4A373]" />
-              <span>
-                Run Automated Tests {testPassedCount !== undefined ? `(${testPassedCount} Passed)` : ''}
-              </span>
-            </button>
+              {isProductionFloorEnabled ? 'Enabled' : 'Disabled'}
+            </span>
+          }
+          isOpen={!!openSections.production_floor}
+          onToggle={() => toggleSection('production_floor')}
+        >
+          <div className="pt-1">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div className="flex items-start gap-3.5">
+                <div className="w-10 h-10 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 text-amber-700 dark:text-amber-400 flex items-center justify-center shrink-0 mt-0.5 shadow-xs">
+                  <ChefHat className="w-5 h-5 stroke-[2.5]" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h3 className="font-serif font-semibold text-base text-[#5A534B] dark:text-[#EAE6E1]">
+                      Production Floor Mode
+                    </h3>
+                    <span
+                      className={`px-2.5 py-0.5 text-[10px] font-bold rounded-full uppercase tracking-wider ${
+                        isProductionFloorEnabled
+                          ? 'bg-emerald-100 dark:bg-emerald-950/50 text-emerald-800 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-800'
+                          : 'bg-stone-100 dark:bg-zinc-800 text-stone-600 dark:text-zinc-400 border border-stone-200 dark:border-zinc-700'
+                      }`}
+                    >
+                      {isProductionFloorEnabled ? 'Enabled' : 'Disabled'}
+                    </span>
+                  </div>
+                  <p className="text-xs text-[#8B7E74] dark:text-[#A39E93] mt-1 max-w-xl leading-relaxed">
+                    When enabled, operators can use the simplified Production Floor interface for recipe scaling and mixing. When disabled, the application opens directly into Management Mode.
+                  </p>
+                </div>
+              </div>
+
+              {/* Toggle Switch and [ ON / OFF ] controls (Owner Only) */}
+              <div className="flex items-center gap-3 shrink-0 self-start sm:self-center">
+                {!isOwnerRole && (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-stone-100 dark:bg-zinc-800 border border-stone-200 dark:border-zinc-700 text-stone-600 dark:text-zinc-400 text-[10px] font-bold uppercase tracking-wider">
+                    <Lock className="w-3 h-3" />
+                    <span>Owner Only</span>
+                  </span>
+                )}
+                <div className="flex items-center bg-[#F9F8F6] dark:bg-[#25221F] p-1 rounded-xl border border-[#EEECE8] dark:border-[#332F2B]">
+                  <button
+                    type="button"
+                    id="production-floor-mode-on-btn"
+                    disabled={!isOwnerRole}
+                    onClick={() => handleToggleProductionFloor(true)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer flex items-center gap-1.5 ${
+                      isProductionFloorEnabled
+                        ? 'bg-amber-500 text-white shadow-xs'
+                        : 'text-[#8B7E74] dark:text-[#A39E93] hover:text-[#5A534B] dark:hover:text-[#EAE6E1]'
+                    } ${!isOwnerRole ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  >
+                    <span>ON</span>
+                  </button>
+                  <button
+                    type="button"
+                    id="production-floor-mode-off-btn"
+                    disabled={!isOwnerRole}
+                    onClick={() => handleToggleProductionFloor(false)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer flex items-center gap-1.5 ${
+                      !isProductionFloorEnabled
+                        ? 'bg-[#5A534B] dark:bg-[#3D3732] text-white shadow-xs'
+                        : 'text-[#8B7E74] dark:text-[#A39E93] hover:text-[#5A534B] dark:hover:text-[#EAE6E1]'
+                    } ${!isOwnerRole ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  >
+                    <span>OFF</span>
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  id="production-floor-mode-toggle"
+                  role="switch"
+                  aria-checked={isProductionFloorEnabled}
+                  aria-label="Toggle Production Floor Mode"
+                  disabled={!isOwnerRole}
+                  onClick={() => handleToggleProductionFloor(!isProductionFloorEnabled)}
+                  className={`w-14 h-8 flex items-center rounded-full p-1 transition-colors duration-200 cursor-pointer ${
+                    isProductionFloorEnabled
+                      ? 'bg-amber-500 ring-2 ring-amber-500/20'
+                      : 'bg-stone-300 dark:bg-zinc-700'
+                  } ${!isOwnerRole ? 'opacity-50 cursor-not-allowed' : ''}`}
+                >
+                  <div
+                    className={`bg-white w-6 h-6 rounded-full shadow-md transform transition-transform duration-200 ${
+                      isProductionFloorEnabled ? 'translate-x-6' : 'translate-x-0'
+                    }`}
+                  />
+                </button>
+              </div>
+            </div>
           </div>
-        </div>
+        </CollapsibleSettingsSection>
+
+        {/* Section 14: Optional Management Mode PIN Lock */}
+        <CollapsibleSettingsSection
+          sectionKey="lock"
+          title="Management Mode Lock"
+          description="Require a secure PIN to access recipe formulas, costing, ingredients, and settings."
+          icon={<Lock className="w-5 h-5 text-[#D4A373]" />}
+          isOpen={!!openSections.lock}
+          onToggle={() => toggleSection('lock')}
+        >
+          <SettingsSectionErrorBoundary
+            sectionTitle="Management Mode Lock"
+            fallbackMessage="Unable to load management lock settings."
+          >
+            <ManagementLockSettings
+              userRole={userRole}
+              onNotification={showNotification}
+              onLockConfigured={onManagementLockConfigured}
+            />
+          </SettingsSectionErrorBoundary>
+        </CollapsibleSettingsSection>
+
+        {/* Section 15: Appearance & Verification Suite */}
+        <CollapsibleSettingsSection
+          sectionKey="system"
+          title="Appearance & Unit Verification Suite"
+          description="Theme mode selector and internal unit verification testing suite."
+          icon={<Sun className="w-5 h-5 text-[#D4A373]" />}
+          isOpen={!!openSections.system}
+          onToggle={() => toggleSection('system')}
+        >
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-1">
+            {/* Theme Toggle */}
+            <div className="bg-[#FAF8F5] dark:bg-[#25221F] border border-[#EEECE8] dark:border-[#332F2B] rounded-xl p-4 sm:p-5 space-y-3">
+              <h4 className="font-serif font-semibold text-sm text-[#5A534B] dark:text-[#EAE6E1]">
+                Theme Mode
+              </h4>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => handleUpdateTheme('light')}
+                  className={`flex-1 p-3 rounded-xl border font-bold text-xs flex items-center justify-center gap-2 transition cursor-pointer ${
+                    settings.theme === 'light'
+                      ? 'bg-[#5A534B] text-white border-[#5A534B] ring-2 ring-[#D4A373]/50'
+                      : 'bg-[#F9F8F6] dark:bg-[#1E1B18] border-[#EEECE8] dark:border-[#332F2B] text-[#5A534B] dark:text-[#EAE6E1]'
+                  }`}
+                >
+                  <Sun className="w-4 h-4 text-[#D4A373]" />
+                  <span>Light Theme</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleUpdateTheme('dark')}
+                  className={`flex-1 p-3 rounded-xl border font-bold text-xs flex items-center justify-center gap-2 transition cursor-pointer ${
+                    settings.theme === 'dark'
+                      ? 'bg-[#5A534B] text-white border-[#5A534B] ring-2 ring-[#D4A373]/50'
+                      : 'bg-[#F9F8F6] dark:bg-[#1E1B18] border-[#EEECE8] dark:border-[#332F2B] text-[#5A534B] dark:text-[#EAE6E1]'
+                  }`}
+                >
+                  <Moon className="w-4 h-4 text-[#D4A373]" />
+                  <span>Dark Theme</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Unit Test Suite Launcher */}
+            <div className="bg-[#FAF8F5] dark:bg-[#25221F] border border-[#EEECE8] dark:border-[#332F2B] rounded-xl p-4 sm:p-5 space-y-3 flex flex-col justify-between">
+              <div>
+                <h4 className="font-serif font-semibold text-sm text-[#5A534B] dark:text-[#EAE6E1] flex items-center gap-2">
+                  <FlaskConical className="w-4 h-4 text-[#D4A373]" />
+                  <span>Unit Verification Suite</span>
+                </h4>
+                <p className="text-xs text-[#8B7E74] dark:text-[#A39E93] mt-1">
+                  Run internal tests for scaling math, waste formulas, unit conversions, and capacity limits.
+                </p>
+              </div>
+
+              <button
+                id="settings-run-tests-btn"
+                type="button"
+                onClick={onOpenUnitTests}
+                className="w-full bg-[#F5F2ED] dark:bg-[#1E1B18] text-[#5A534B] dark:text-[#EAE6E1] hover:bg-[#EEECE8] font-bold py-2.5 px-4 rounded-xl text-xs transition cursor-pointer flex items-center justify-center gap-2 border border-[#E5E1DA] dark:border-[#332F2B]"
+              >
+                <ShieldCheck className="w-4 h-4 text-[#D4A373]" />
+                <span>
+                  Run Automated Tests {testPassedCount !== undefined ? `(${testPassedCount} Passed)` : ''}
+                </span>
+              </button>
+            </div>
+          </div>
+        </CollapsibleSettingsSection>
       </div>
     </div>
   );
